@@ -6,9 +6,11 @@ param(
     [string]$NgramVolume = 'infernix-hc4-ple-a78ba00a',
     [string]$ModelsDirectory = (Join-Path $env:USERPROFILE 'models'),
     [string]$Image = 'infernix:n1x',
-    [string]$Name = 'infernix-n1x-hc4',
+    [string]$Name = 'infernix-n1x-hc4-256k',
     [ValidateRange(1, 65535)][int]$Port = 8001,
     [ValidateRange(1, 8)][int]$MaxConcurrency = 8,
+    [ValidateRange(1, 262144)][int]$MaxContext = 262144,
+    [ValidateRange(1, 262144)][int]$DefaultMaxTokens = $MaxContext,
     [switch]$PrintOnly
 )
 
@@ -38,9 +40,9 @@ $arguments = @(
     '--ngram-residency', 'volume', '--ngram-cache-mib', '512',
     '--spec', 'dflash2', '--draft-model', "/draft/$($draftWeights.Name)",
     '--draft-tokens', '3', '--draft-tree-nodes', '0', '--no-cuda-graph',
-    '--kv-dtype', 'int8', '--max-context', '16384', '--kv-capacity', [string][Math]::Min(65536, 16384 * $MaxConcurrency),
+    '--kv-dtype', 'int8', '--max-context', [string]$MaxContext, '--kv-capacity', [string]$MaxContext,
     '--host-context-mib', '1024', '--max-concurrency', [string]$MaxConcurrency, '--prefill-chunk', '4096',
-    '--default-max-tokens', '128', '--host', '0.0.0.0', '--port', '8002'
+    '--default-max-tokens', [string]$DefaultMaxTokens, '--host', '0.0.0.0', '--port', '8002'
 )
 if ($PrintOnly) { $arguments | ConvertTo-Json; return }
 & wslc @arguments

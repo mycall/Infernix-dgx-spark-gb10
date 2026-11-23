@@ -66,7 +66,7 @@ wslc build -f Dockerfile.n1x -t infernix:n1x .
 Invoke-RestMethod http://127.0.0.1:8001/health
 ```
 
-This profile serves up to eight concurrent requests with a 16,384-token per-request limit, a 65,536-token pooled INT8 KV budget and three DFlash2 drafts per round. Use `-MaxConcurrency 1` for the original single-lane configuration.
+This profile serves the native 262,144-token context with three DFlash2 drafts per round. Prompt, reasoning and final output share that window. A client that omits its output limit can generate until the remaining context is exhausted or the model stops. Up to eight requests share the 262,144-token INT8 KV pool. Use `-MaxContext` to size the window and pool together, or `-DefaultMaxTokens` to set a smaller default completion budget.
 It uses eager CUDA launches because sampled requests on the N1X produced non-finite logits
 with captured graphs. The endpoint becomes available after the model loads and warmup completes.
 
