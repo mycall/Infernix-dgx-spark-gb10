@@ -55,3 +55,18 @@ After changing the partition and starting the same daily Infernix profile, run t
 ```powershell
 .\bench\n1x\compare-partitions.ps1 -OutDir (Join-Path $env:LOCALAPPDATA ("infernix-bench/partition-" + (Get-Date -Format yyyyMMdd-HHmmss)))
 ```
+
+## Return to 8 GiB after reboot
+
+| Same repeat runner, warm workloads | 8 GiB | 96 GiB |
+| --- | ---: | ---: |
+| Fixed 128-token decode, 24 outputs, median (range) | 84.00 tok/s (81.59–85.15) | 88.92 tok/s (86.26–90.44) |
+| Tool follow-up, 12 correct tasks, median (range) | 4.984 s (4.954–5.073) | 4.827 s (4.777–4.939) |
+| Setup plus tool follow-up, median | 8.226 s | 7.972 s |
+| Windows-visible RAM | 118.5 GiB | 30.5 GiB |
+| Windows free RAM before warmup, model loaded | 32.0 GiB | 14.4 GiB |
+| Adapter dedicated / shared use before warmup | 7.8 / 68.8 GiB | 74.5 / 2.6 GiB |
+
+The same Infernix image and launch arguments ran on driver 621.24, on AC and the Balanced power scheme. All 24 fixed outputs matched across runs. All scored tool selections and answers reused 8,192 tokens apiece and generated 101 and 65 tokens respectively. Server counters recorded exactly the 69 expected successful requests on each boot including warmups. At GPU utilization of at least 80%, median SM clocks were 2,372 and 2,385 MHz and median GPU temperatures were 73.2 and 72.9 °C at 8 and 96 GiB.
+
+Across the earlier 8 GiB run, the 96 GiB repeat and the fresh 8 GiB repeat, median decode went from 77.92 to 88.92 to 84.00 tok/s. The matched extended runs put the 96 GiB advantage at 5.9% for decode and 0.157 s (3.2%) per short tool follow-up. Both ranges stayed separate. The difference between the two 8 GiB boots shows why the larger initial percentage should not be treated as a fixed penalty. The fresh boot restored 88 GiB of Windows-visible memory. With the model loaded there was 17.5 GiB more free in the pre-run snapshot, which also reflects other system activity. Desktop performance under load and a 4 GiB partition were outside this test. [8 GiB repeat and telemetry](20261123-partition-repeat-8g.tar.gz) · [96 GiB repeat and telemetry](20261123-partition-repeat-96g.tar.gz)
