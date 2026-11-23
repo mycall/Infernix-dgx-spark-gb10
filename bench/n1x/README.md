@@ -17,6 +17,8 @@ Resolve any conflicting upstream changes on the branch and test before publishin
 
 ## Preserved experiments
 
+- [Same-image 8 versus 96 GiB partition comparison](20261123-partition-comparison.md)
+
 - [Native 262K context at 8 GiB versus qwen38fn-best history](20261123-native-context.md)
 
 - [Inventory task history versus qwen38fn-best](20261122-n1x-best-results.csv)
