@@ -554,7 +554,7 @@ it would run under WSL2 with the GGUF on an ext4 volume.
 | **JigSawPT's llama.cpp fork on one RTX 5090** (`dsv41-porte` with the "Crow" expert-streaming patches; 125.7 GiB RAM; llama.cpp discussion #28766, 2026-09-11/23) | MXFP4 experts (269 GiB): 18 GiB VRAM cache, 72 GiB pinned host tier, the rest streamed from NVMe; Engram mmapped from disk | [M] decode **5.12 tok/s on new content** (time to first token 8.56 s) and 21.27 tok/s on content already resident; host tier 0 / 32 / 64 / 72 GiB with direct I/O: 3.9 / 6.2 / 8.0 / 8.3 tok/s (buffered 3.0-4.3); **VRAM hit rate 62.7 %**, 59 → 66 % from 13 to 22 GiB with throughput flat; 26 new experts per token late in a reply; per remap call 54 % NVMe, 26 % PCIe, 20 % compute, the disk at 43 % of its rate; a layer predictor reached 70.9 % recall at depth 6 but prefetch lost 7-19 %; DSpark at draft length 2 accepted 51-79 % (97 % on verbatim text) for **−4 % cold and ±0 resident**; output not reproducible above ~1,024 tokens unless one I/O thread is used |
 | **ik_llama.cpp** (V4.1 merged 2026-09-21, PR #2455) | experts on the CPU except six layers, Q3_K_M; Engram rows from the page cache | [M] 14.13 tok/s plain, 19.86 with DSpark n_max 3 (60.1 % accepted), 14.33 with n_max 5 (45.5 %), on a 32-core, 251 GB, two-GPU host |
 | llama.cpp PR #28696 (open) | Engram tables as Q8_0 on the CPU, mmap | [M] GB10 Q2_K 2.8 tok/s; DSpark block 5 accepted 43.6 %, block 3 59.1 %; "Corpus NLL against the reference is not done" |
-| **Xolotl** (`Indras-Mirror/Strata-DSV4.1`, a Strata fork) | RTX 4090, 90 GB DDR4, one NVMe; GSQ mixed ternary, 2- and 3-bit experts (~152 GiB): hottest in VRAM, a 64 GB pinned RAM cache, the rest on NVMe; Engram (~200 GB) on NVMe | [M as stated; benchmark file unavailable] decode 26.8 tok/s, prefill 180-320 tok/s |
+| **Indras-Mirror/Strata-DSV4.1** (a Strata fork) | RTX 4090, 90 GB DDR4, one NVMe; GSQ mixed ternary, 2- and 3-bit experts (~152 GiB): hottest in VRAM, a 64 GB pinned RAM cache, the rest on NVMe; Engram (~200 GB) on NVMe | [M as stated; benchmark file unavailable] decode 26.8 tok/s, prefill 180-320 tok/s |
 | FreeToken (arXiv 2608.16157), DeepSeek-**V4**-Flash (284B, 256 experts, MXFP4) | one global LRU; RTX 5090 at x16 (52.7 GB/s), 180 GiB RAM | [M] decode miss rate at 11 % cache: **39 %** (KTransformers 59 %, llama.cpp 89 %); 22-25 tok/s |
 | hipfire, V4-Flash-0731 (MQ2) on Strix Halo | expert cache by budget | [M] hit rate 40.5 / 59.4 / 74.4 / 86.5 / 91.0 % at 4 / 8 / 16 / 32 / 64 GiB; a learned next-layer predictor (recall@6 75.9 %) ran 0.86-0.93× and is off |
 | KTransformers | V4-Flash only (RTX 5090 and ≥ 200 GB RAM) | [C] "20+ tok/s"; no V4.1 |
@@ -597,7 +597,7 @@ What transfers:
 - **Bounded replay costs little** on GSM8K (−0.005, within one standard error) and is what DeepSeek
   and both datacenter engines serve. Token-level measurements since then show a larger change (Maya,
   §4.3), so the default is the exact rule (decision g) and replay an option.
-- **Engram is random row reads from disk everywhere** (DS4, JigSawPT, Xolotl, OpensourceWTF) or
+- **Engram is random row reads from disk everywhere** (DS4, JigSawPT, Indras-Mirror/Strata-DSV4.1, OpensourceWTF) or
   pinned host memory where RAM allows (vLLM). No engine found it a bottleneck in decode; in prompts
   it can be one where reads are issued from too few threads (Maya, §4.3).
 - **Other engines are not reproducible across their own execution modes** (DS4 scalar vs batched,

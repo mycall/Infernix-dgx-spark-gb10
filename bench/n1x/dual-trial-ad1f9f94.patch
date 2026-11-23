@@ -1,0 +1,247 @@
+diff --git a/src/models/qwen4_exp/config.cpp b/src/models/qwen4_exp/config.cpp
+index 33207c16..c96d9344 100644
+--- a/src/models/qwen4_exp/config.cpp
++++ b/src/models/qwen4_exp/config.cpp
+@@ -321,7 +321,7 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
+             if (options.mtp() && !directory.components.contains("mtp")) {
+                 throw ArtifactError("the artifact has no MTP component");
+             }
+-            out.mtp = options.mtp();
++            out.mtp = options.mtp() || (options.dflash2() && std::getenv("INFERNIX_TRY_DUAL"));
+             // The drafter pool's slots (LoadOptions::mtp_expert_pool), measured best per bank kind (2026-10-27, MTP
+             // decode with three drafts, ABBA): GGUF imports 128 (IQ3_S +4.0 %; 256 +1.1 %), NVFP4 banks 256 (Dense8
+             // +1.9 %; 128 -0.5 %). At least top_k + 2 (a swap holds a slot out of the route, two at a time at most).
+diff --git a/src/models/qwen4_exp/program/prefix/prefix_program.cpp b/src/models/qwen4_exp/program/prefix/prefix_program.cpp
+index 90237494..b2769cda 100644
+--- a/src/models/qwen4_exp/program/prefix/prefix_program.cpp
++++ b/src/models/qwen4_exp/program/prefix/prefix_program.cpp
+@@ -679,6 +679,9 @@ prefix::CallPlan ProgramImpl::plan_prefill(const qwen3_5::PreparedPromptData& pr
+             }
+         };
+         exact_boundary(branch);
++        if (std::getenv("INFERNIX_TRY_TAIL") && options_.free_cache_resume && n > frontier + 2048) {
++            exact_boundary(((n - kBlock) / kBlock) * kBlock);
++        }
+         if (const auto forced = testing::forced_tap()) { exact_boundary(*forced); }
+         if (!options_.free_cache_resume) {
+             // Each tap moves to the chunk-grid position at or before it (resume_grid), where the cold prefill's
+diff --git a/src/models/qwen4_exp/program/prefix/state_image.cpp b/src/models/qwen4_exp/program/prefix/state_image.cpp
+index fe622db5..8336b5f9 100644
+--- a/src/models/qwen4_exp/program/prefix/state_image.cpp
++++ b/src/models/qwen4_exp/program/prefix/state_image.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "models/qwen4_exp/program/prefix/state_image.h"
+ 
+ #include "core/device.h"
+@@ -116,7 +117,7 @@ StateImageSpec state_image_spec(const TextConfig& c, bool mtp, KvCacheStorage st
+     spec.qsa_tail_bytes = static_cast<std::size_t>(c.qsa.index_head_dim) * (c.qsa.compress_ratio - 1U) * 2U;
+     spec.mtp            = mtp;
+     spec.draft_ring     = draft_ring;
+-    if (mtp && draft_ring.layers != 0) { throw std::invalid_argument("Qwen4Exp state image: one drafter"); }
++    if (mtp && draft_ring.layers != 0 && !std::getenv("INFERNIX_TRY_DUAL")) { throw std::invalid_argument("Qwen4Exp state image: one drafter"); }
+     if (mtp) {
+         spec.mtp_saved_bytes = static_cast<std::size_t>(c.residual_width()) * 2U;
+         spec.mtp_tail_bytes  = spec.qsa_tail_bytes;
+diff --git a/src/models/qwen4_exp/program/program_impl.h b/src/models/qwen4_exp/program/program_impl.h
+index 449000d5..cc8540fd 100644
+--- a/src/models/qwen4_exp/program/program_impl.h
++++ b/src/models/qwen4_exp/program/program_impl.h
+@@ -498,7 +498,11 @@ public:
+         // state_tokens - 1, whose cell is written (mtp_cells == state_tokens) or pending
+         // (state_tokens - 1: the next call or round writes it).
+         std::uint32_t mtp_cells = 0;
+-        bool mtp_live           = false;
++        std::chrono::steady_clock::time_point trial_begin{};
++    int trial_start_tokens = -1;
++    int trial_start_batch = 0;
++    bool trial_previous_mtp = false;
++    bool mtp_live           = false;
+         // DFlash2: the context ring holds every position below this one (state_tokens at every
+         // settled point, except after a resume from a tap inside a prefill layer walk).
+         std::uint32_t dflash_frontier = 0;
+@@ -542,7 +546,7 @@ public:
+             throw std::invalid_argument("Qwen4Exp: MTP needs 1..7 draft tokens");
+         }
+         // Verification widths up to 8 keep the dense routes column-invariant (design 11.3).
+-        if (config.dflash2 && (o.dflash2_draft_tokens == 0 || o.dflash2_draft_tokens > 7 || config.mtp)) {
++        if (config.dflash2 && (o.dflash2_draft_tokens == 0 || o.dflash2_draft_tokens > 7 || (config.mtp && (!std::getenv("INFERNIX_TRY_DUAL"))))) {
+             throw std::invalid_argument("Qwen4Exp: DFlash2 needs 1..7 draft tokens and no MTP drafter");
+         }
+         // Its drafts are verified with their laws (sparse acceptance, which serves one token domain).
+@@ -1827,6 +1831,10 @@ public:
+         }
+         lane.history.assign(data.token_ids.begin(), data.token_ids.end());
+         lane.history.reserve(lane.history.size() + q.summary.effective_output_tokens + 1);
++        if (mtp_ && dflash2_) {
++            trial_use_mtp_ = std::filesystem::exists("/tmp/infernix-trial-mtp");
++            std::fprintf(stderr, "trial drafter %s\n", trial_use_mtp_ ? "mtp" : "dflash2");
++        }
+         lane.prompt_tokens  = static_cast<std::uint32_t>(lane.history.size());
+         // A prompt with media keeps its M-RoPE positions; every other token is its index + delta.
+         lane.rope.prompt_tokens = lane.prompt_tokens;
+@@ -2770,7 +2778,66 @@ public:
+         // Columns of each verification row whose n-gram rows are already staged: the drafter's
+         // wait reads every committed-token column (the anchor's) and all of a copy row's.
+         std::array<std::int32_t, kMaximumConcurrency> staged{};
+-        if (mtp_) {
++        if (mtp_ && dflash2_) {
++            const auto trial_now = std::chrono::steady_clock::now();
++            for (int b = 0; b < batch; ++b) {
++                Lane& l = lanes_[lanes[b]];
++                const int out = static_cast<int>(l.history.size() - l.prompt_tokens);
++                const int from = l.trial_start_tokens;
++                if (out > from && from >= 0 && ((from >= 25 && from <= 42) || (from >= 56 && from <= 75)) &&
++                    l.sampling.seed >= 110 && l.sampling.seed <= 113) {
++                    const double ms = std::chrono::duration<double, std::milli>(trial_now - l.trial_begin).count();
++                    std::fprintf(stderr, "trial round seed=%llu lane=%u from=%d to=%d head=%s batch=%d ms=%.3f\n",
++                        static_cast<unsigned long long>(l.sampling.seed), lanes[b], from, out,
++                        l.trial_previous_mtp ? "mtp" : "dflash2", l.trial_start_batch, ms);
++                }
++                l.trial_start_tokens = out;
++                l.trial_start_batch = batch;
++                l.trial_begin = trial_now;
++            }
++            // Experiment restricted to deterministic proposals and chain verification.
++            std::array<std::uint32_t, kMaximumConcurrency> grouped{};
++            std::array<std::int32_t, kMaximumConcurrency> row{};
++            width = 1;
++            for (int head = 0; head != 2; ++head) {
++                int count = 0;
++                int max_k = 0;
++                for (int b = 0; b < batch; ++b) {
++                    Lane& lane = lanes_[lanes[b]];
++                    if (lane.sampling.temperature != 0) {
++                        continue; // Non-greedy startup warmup uses target-only decoding.
++                    }
++                    const auto emitted = lane.history.size() - lane.prompt_tokens;
++                    const auto mode = lane.sampling.seed;
++                    const bool use_mtp = mode == 111 || (mode == 112 && emitted >= 32) ||
++                                        (mode == 113 && emitted >= 32 && emitted < 64);
++                    if (head != static_cast<int>(use_mtp)) { continue; }
++                    const int remaining = static_cast<int>(budgets[b].generated_tokens_remaining);
++                    const int k = std::min(3, std::max(0, remaining - 1));
++                    if (!k || (use_mtp && !lane.mtp_live)) { continue; }
++                    if (emitted <= 1 || (mode >= 112 && mode <= 113 && lane.trial_previous_mtp != use_mtp)) {
++                        std::fprintf(stderr, "trial route seed=%llu lane=%u generated=%zu head=%s batch=%d\n",
++                            static_cast<unsigned long long>(mode), lanes[b], emitted, use_mtp ? "mtp" : "dflash2", batch);
++                    }
++                    lane.trial_previous_mtp = use_mtp;
++                    grouped[count] = lanes[b];
++                    row[count++] = b;
++                    max_k = std::max(max_k, k);
++                }
++                if (!count) { continue; }
++                const std::span<const std::uint32_t> group(grouped.data(), count);
++                if (head) { mtp_draft(group, max_k); } else { dflash2_propose(group, {}); }
++                for (int j = 0; j < count; ++j) {
++                    const int b = row[j];
++                    const int limit = static_cast<int>(budgets[b].generated_tokens_remaining) - 1;
++                    const int n = std::min({3, limit, head ? mtp_confident_[j] : dflash_confident_[j]});
++                    const auto& ids = head ? mtp_drafts_[j] : dflash_drafts_[j];
++                    drafts_[b].assign(ids.begin(), ids.begin() + n);
++                    from_ngram_[b] = false;
++                    extents[b] = n;
++                    width = std::max(width, 1 + n);
++                }
++            }        } else         if (mtp_ && (!dflash2_ || trial_use_mtp_)) {
+             mtp_draft(std::span<const std::uint32_t>(lanes.data(), batch), steps, [&] {
+                 if (width == 1 || use_direct_ple()) { return; }
+                 std::array<std::int32_t, kMaximumConcurrency> zero{};
+@@ -2840,7 +2907,7 @@ public:
+                 // below --spec-min-p, and with --draft-tokens auto only the calibrated length of them
+                 // (draft_length.h). The proposal staged only column 0's n-gram rows.
+                 if (batch == 1 && !from_ngram_[0] && extents[0] > 0) {
+-                    if (options_.auto_draft_length) { extents[0] = dflash2_auto_length(lanes_[lanes[0]], extents[0]); }
++                    if (options_.auto_draft_length && !mtp_) { extents[0] = dflash2_auto_length(lanes_[lanes[0]], extents[0]); }
+                 } else if (batch >= 2 && options_.auto_draft_length) {
+                     // A multi-row DFlash2 round verifies one width across its drafter rows, chosen from
+                     // all rows' drafts (dflash2_pair_width); its drafter rows keep at most that many.
+@@ -3084,7 +3151,7 @@ public:
+             upload_pinned(spec_device(spec_layout_.commit), commit, 4ULL * rows.size(), device_.stream);
+             if (mtp_) {
+                 mtp_catch_up(rows, 1, commit);
+-            } else {
++            } if (dflash2_) {
+                 dflash2_catch_up(rows, 1, commit);
+             }
+         }
+@@ -6045,7 +6112,7 @@ private:
+                 }
+                 // The chain's verified drafts against the cumulative cut's bin table (both argmax and
+                 // sampled 16-rank drafts under --draft-tokens auto).
+-                if (mtp_ && !dflash2_ && options_.auto_draft_length && nn > 0) {
++                if (mtp_ && (!dflash2_ || trial_use_mtp_) && options_.auto_draft_length && nn > 0) {
+                     const bool row_sampled = sparse && lane.sampling.temperature > 0.0F;
+                     lane.mtp_cumulative.observe(mtp_draft_logprobs_[static_cast<std::size_t>(b)].data(),
+                                                 static_cast<std::int32_t>(std::min<std::uint64_t>(nn, 8)),
+@@ -6054,7 +6121,7 @@ private:
+                                                 row_sampled ? kMtpSampledCumulativeBase : kMtpCumulativeBase,
+                                                 row_sampled ? kMtpSampledCumulativeFloor : kMtpCumulativeFloor);
+                 }
+-                if (dflash2_ && nn > 0) {
++                if (dflash2_ && !mtp_ && nn > 0) {
+                     const std::span<const float> confidences(dflash_confidence_[b].data(), nn);
+                     const auto verified = static_cast<std::uint32_t>(nn);
+                     const auto taken    = static_cast<std::uint32_t>(neural_A);
+@@ -6380,7 +6447,7 @@ private:
+     // auto_draft_length) drafts mtp_k_ every round.
+     std::int32_t choose_draft_length(Lane& lane) const {
+         const std::int32_t k = draft_length_at(lane, lane.mtp_policy_rounds + 1);
+-        if (options_.auto_draft_length && !dflash2_) { ++lane.mtp_policy_rounds; }
++        if (options_.auto_draft_length && (!dflash2_ || trial_use_mtp_)) { ++lane.mtp_policy_rounds; }
+         return k;
+     }
+ 
+@@ -6388,7 +6455,7 @@ private:
+     std::int32_t draft_length_at(const Lane& lane, std::uint64_t round) const {
+         const std::int32_t most = neural_k();
+         // DFlash2 proposes its whole block; its length is chosen after the proposal (dflash2_auto_length).
+-        if (!options_.auto_draft_length || dflash2_) { return most; }
++        if (!options_.auto_draft_length || (dflash2_ && !trial_use_mtp_)) { return most; }
+         std::int32_t best = 0;
+         double best_score = 1.0;
+         double reach = 1.0, tokens = 1.0;
+@@ -6467,7 +6534,7 @@ private:
+         if (!drafter_live(a) || !drafter_live(b)) { return 0; }
+         const std::int32_t pair_max = dflash2_ ? kDFlashPairMaxDrafts : kPairMaxDrafts;
+         const std::int32_t most     = std::min(pair_max, neural_k());
+-        if (!options_.auto_draft_length || dflash2_) { return most; }
++        if (!options_.auto_draft_length || (dflash2_ && !trial_use_mtp_)) { return most; }
+         std::int32_t best = 0;
+         double best_score = 2.0;
+         double reach_a = 1.0, reach_b = 1.0, tokens = 2.0;
+@@ -7934,8 +8001,8 @@ private:
+     bool plain_round_ = false;
+ 
+     // The neural drafter's most drafts per round (MTP's or DFlash2's), and whether a lane drafts.
+-    [[nodiscard]] std::int32_t neural_k() const noexcept { return mtp_ ? mtp_k_ : dflash_k_; }
+-    [[nodiscard]] bool drafter_live(const Lane& lane) const noexcept { return mtp_ ? lane.mtp_live : dflash2_; }
++    [[nodiscard]] std::int32_t neural_k() const noexcept { return mtp_ && (!dflash2_ || trial_use_mtp_) ? mtp_k_ : dflash_k_; }
++    [[nodiscard]] bool drafter_live(const Lane& lane) const noexcept { return mtp_ && (!dflash2_ || trial_use_mtp_) ? lane.mtp_live : dflash2_; }
+ 
+     // ---------------------------------------------------------------- DFlash2 drafter (dflash2_program.cpp)
+     void allocate_dflash2(std::int32_t lanes, std::uint64_t& allocated);
+@@ -7988,6 +8055,7 @@ private:
+     std::pair<std::size_t, std::size_t> dflash2_verify_planes(std::int32_t batch, std::int32_t K,
+                                                               bool tree_round = false);
+     bool dflash2_          = false;
++    bool trial_use_mtp_ = false;
+     bool dflash_round_     = false; // this verification's neural drafts are DFlash2's
+     std::int32_t dflash_k_ = 0;
+     DeviceBuffer dflash_ring_backing_, dflash_features_, dflash_device_;
+diff --git a/src/runtime/engine/qwen4_exp_instance.cpp b/src/runtime/engine/qwen4_exp_instance.cpp
+index cda25641..4b1c7d7c 100644
+--- a/src/runtime/engine/qwen4_exp_instance.cpp
++++ b/src/runtime/engine/qwen4_exp_instance.cpp
+@@ -246,6 +246,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
+                                                : 0U;
+     // A fixed draft length verifies every draft unless --spec-min-p asks for the cut.
+     program_options.auto_draft_length = options.speculative.draft_tokens_auto;
++    if (options.speculative.backend == SpeculativeBackend::DFlash2 && std::getenv("INFERNIX_TRY_DUAL")) {
++        program_options.mtp_draft_tokens = 3;
++        program_options.auto_draft_length = false;
++    }
+     // MTP's automatic length cuts by its drafts' cumulative acceptance (MtpCumulative) and DFlash2's
+     // calibrated length needs no cut.
+     program_options.draft_min_p = options.speculative.draft_min_p.value_or(0.0F);

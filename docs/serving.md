@@ -51,6 +51,25 @@ and prefill remain outside speculative acceleration. A later request cannot enab
 omitted at startup. The artifact need only contain the Text backbone and the optional components
 selected for this process.
 
+### HC4-W4Dense with DFlash2 on N1X under WSLC
+
+The [PowerShell launcher](../tools/run_wslc_hc4_dflash2.ps1) uses a local ARM64 CUDA 13.5
+image containing `infernix-serve` and a WSLC volume containing
+`Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram`. It looks for the HC4-W4Dense model and
+the Infernix DFlash2 companion in their respective directories under `$env:USERPROFILE\models`.
+Use `-ModelsDirectory` or `-Image` to override those defaults.
+
+```powershell
+wslc build -f Dockerfile.n1x -t infernix:n1x .
+.\tools\prepare_wslc_hc4_ngram.ps1
+.\tools\run_wslc_hc4_dflash2.ps1
+Invoke-RestMethod http://127.0.0.1:8001/health
+```
+
+This profile serves up to eight concurrent requests with a 16,384-token per-request limit, a 65,536-token pooled INT8 KV budget and three DFlash2 drafts per round. Use `-MaxConcurrency 1` for the original single-lane configuration.
+It uses eager CUDA launches because sampled requests on the N1X produced non-finite logits
+with captured graphs. The endpoint becomes available after the model loads and warmup completes.
+
 ### Stop the server
 
 Press Ctrl+C twice to stop the server. The first press only shows a prompt on the console's bottom

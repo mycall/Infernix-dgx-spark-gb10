@@ -17,3 +17,6 @@
 # Binary fixtures under those paths stay untouched.
 /bench/fixtures/**/*.png binary
 /tools/freq_corpus/fixtures/**/*.i64 binary
+
+# Unified diff context lines retain their leading space, including blank lines.
+/bench/n1x/dual-trial-ad1f9f94.patch -whitespace eol=lf
