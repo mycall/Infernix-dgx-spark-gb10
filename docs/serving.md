@@ -79,6 +79,17 @@ and [host prefix-cache comparison](../bench/n1x/20261123-partition-comparison.md
 It uses eager CUDA launches because sampled requests on the N1X produced non-finite logits
 with captured graphs. The endpoint becomes available after the model loads and warmup completes.
 
+### OpenCode lookup worker on N1X
+
+With the local Infernix provider configured, select the [parallel worker profile](../tools/infernix-parallel.jsonc) from the fork root in PowerShell.
+
+```powershell
+$env:OPENCODE_CONFIG = (Resolve-Path .\tools\infernix-parallel.jsonc).Path
+opencode run --standalone "Use the lookup subagent to read tools/infernix-parallel.jsonc and return the lookup agent's model ID."
+```
+
+The named `lookup` subagent uses medium reasoning and an 8,192-token output allowance. Use `explore` for investigations across files. Explore uses template-default reasoning with the same worker allowance. The parent uses the ordinary `infernix/infernix-hc` model. [Worker measurements](../bench/n1x/20261123-worker-tuning.md)
+
 ### Stop the server
 
 Press Ctrl+C twice to stop the server. The first press only shows a prompt on the console's bottom

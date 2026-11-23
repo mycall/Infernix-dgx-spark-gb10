@@ -1,0 +1,105 @@
+{
+  "providers": {
+    "infernix": {
+      "models": {
+        "infernix-worker": {
+          "modelID": "infernix-hc4",
+          "name": "Infernix HC4 parallel worker",
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          }
+        },
+        "infernix-lookup": {
+          "modelID": "infernix-hc4",
+          "name": "Infernix HC4 lookup (medium)",
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ],
+            "reasoning": {
+              "supported": true,
+              "effort": [
+                "low",
+                "medium",
+                "xhigh"
+              ]
+            }
+          },
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          },
+          "settings": {
+            "reasoningEffort": "medium"
+          },
+          "body": {
+            "reasoning_effort": "medium"
+          }
+        }
+      }
+    }
+  },
+  "agents": {
+    "explore": {
+      "model": "infernix/infernix-worker",
+      "request": {
+        "body": {
+          "max_tokens": 8192
+        }
+      }
+    },
+    "lookup": {
+      "mode": "subagent",
+      "description": "Read a known file to return a specific value, identifier or short quotation. Use Explore for multi-file investigation.",
+      "model": "infernix/infernix-lookup",
+      "request": {
+        "body": {
+          "max_tokens": 8192
+        }
+      },
+      "system": "Read the requested file and return the requested value exactly. State when the file or value is missing.",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "read",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "read",
+          "resource": "*.env",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.*",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.example",
+          "effect": "allow"
+        }
+      ]
+    }
+  },
+  "model": "infernix/infernix-hc"
+}

@@ -26,6 +26,8 @@ All six configuration answers contained the right values. One low-effort answer 
 
 For the verified OpenCode configuration, the worker alias declared reasoning support and set `settings.reasoningEffort` and `body.reasoning_effort` to `low`. The Explore agent referenced that alias with an 8,192-token cap. A loopback test adapter recorded the outgoing fields before forwarding. Across the two counted low runs, all 14 worker requests already contained `low` and the server logged it. The model definition in `fixture-5/opencode.json` in the archive shows the tested fields. Its loopback URL was for instrumentation.
 
+The shipped lookup worker uses the user's preferred medium effort. Replaying the same three direct API fixture pairs at medium gave 3/3 exact marker lookups (median 4.43 s). It recovered the effective route and timeout in all three traces (median 9.52 s). All three missed the strict output contract. One used an array containing an object, and two wrapped the requested array in Markdown fences. Keep structured multi-file work on general Explore. A live OpenCode parent retrieved the correct marker through the named lookup worker after retrying one dispatch with a misspelled model ID. Infernix logged medium effort and an 8,192-token cap on both worker turns. [OpenCode profile](../../tools/infernix-parallel.jsonc)
+
 ## Stable-prefix breakpoint
 
 Compared the ordinary API request with adding `prompt_cache_breakpoint: {"mode":"explicit"}` to the stable system text. Both arms used identical tools and instructions, plus independent early case IDs to prevent a warm hit crossing arms. Each of three pairs per size made an initial read request followed by two tool-result turns. Thinking was disabled for these timing controls.
