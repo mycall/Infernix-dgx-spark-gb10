@@ -17,6 +17,8 @@ Resolve any conflicting upstream changes on the branch and test before publishin
 
 ## Preserved experiments
 
+- [Two-worker admission, context retention and preemption on N1X](20261123-admission-experiments.md)
+
 - [Same-image 8 versus 96 GiB partition comparison](20261123-partition-comparison.md)
 
 - [Native 262K context at 8 GiB versus qwen38fn-best history](20261123-native-context.md)
