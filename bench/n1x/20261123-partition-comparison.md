@@ -38,3 +38,20 @@ Each variant changed one launcher parameter on the same image. Each server start
 Doubling GPU KV eliminated device prefix-block evictions, with essentially the same short follow-up latency and the same near-full score. Raising the host cache to 4 GiB let the admitted client's first continuation reuse another 16,384 tokens. Its cold selection was similar at 89.94 s versus 90.10 s. The second client hit the queue timeout on every Infernix variant. Each near-full configuration was run once, so the host-cache result is evidence for repeated long prefixes, with more repetitions needed to establish its typical benefit. A token budget can govern which work fits in memory. The separate admission deadline bounds how long a caller waits.
 
 The [measurement archive](20261123-partition-comparison.tar.gz) contains requests, responses, hardware readings, profile settings and cache counters. The six earlier short runs are under `8g-inventory/`. The [8 GiB comparison](20261123-native-context.md) identifies the matching earlier near-full and fixed-output records and the Infernix client adaptation. Both live engines used the same near-full task and first-attempt scoring from n1x-ai commit `38cd442`. vLLM used the stock client and Infernix used the adapted client for token counting and API compatibility.
+
+## Longer repeat on the 96 GiB boot
+
+| Measured workload | Earlier 8 GiB | Earlier 96 GiB | Fresh 96 GiB repeat |
+| --- | ---: | ---: | ---: |
+| Fixed 128-token decode, median tok/s | 77.92 (6 outputs) | 89.12 (6) | 88.92 (24, range 86.26–90.44) |
+| Inventory tool follow-up, median seconds | 5.283 (6 tasks) | 4.869 (6) | 4.827 (12, range 4.777–4.939) |
+
+The [repeat runner](compare-partitions.ps1) warmed up both workloads, then alternated their order across four blocks. Block medians were 88.00, 89.28, 89.15 and 89.02 tok/s. All 24 counting outputs matched the six archived 8 GiB outputs exactly and used zero cached prompt tokens. All 12 inventory tasks passed. Each tool selection and final answer reused 8,192 tokens and generated 101 and 65 tokens respectively. The median GPU temperature was 72.9 °C and the median SM clock was 2,385 MHz across 149 samples with at least 80% GPU utilization. The laptop was on AC with the Balanced power scheme. Windows reported 30.5 GiB visible RAM, versus about 119 GiB in the 8 GiB Task Manager snapshot.
+
+The 96 GiB repeat reproduced the initial results on the same boot. A fresh 8 GiB boot with the same runner would test whether the difference reverses with the setting. A subsequent independent 96 GiB boot would give two boots at each setting. A 4 GiB comparison and desktop responsiveness under memory pressure remain unmeasured. [Raw repeat results and telemetry](20261123-partition-repeat-96g.tar.gz)
+
+After changing the partition and starting the same daily Infernix profile, run the following from the engine checkout in PowerShell. The runner records the boot time, partition, image, launch arguments and power scheme in the output directory.
+
+```powershell
+.\bench\n1x\compare-partitions.ps1 -OutDir (Join-Path $env:LOCALAPPDATA ("infernix-bench/partition-" + (Get-Date -Format yyyyMMdd-HHmmss)))
+```
