@@ -67,6 +67,15 @@ Invoke-RestMethod http://127.0.0.1:8001/health
 ```
 
 This profile serves the native 262,144-token context with three DFlash2 drafts per round. Prompt, reasoning and final output share that window. A client that omits its output limit can generate until the remaining context is exhausted or the model stops. Up to eight requests share the 262,144-token INT8 KV pool. Use `-MaxContext` to size the window and pool together, or `-DefaultMaxTokens` to set a smaller default completion budget.
+
+The N1X launcher enables `--fast-path preemption` so workers can grow their KV allocations as they generate.
+It uses 4 GiB of pinned host memory for prefix reuse and allows up to 300 seconds for preparation and admission.
+The longer deadline lets a worker wait through a cold prefill. Two near-full histories can still take turns
+in the shared pool. To apply these defaults to an existing n1x-ai service, run
+`.\n1x.ps1 recreate -Profile infernix-hc4` and then `.\n1x.ps1 wait -Profile infernix-hc4`.
+See the [worker admission measurements](../bench/n1x/20261123-admission-experiments.md)
+and [host prefix-cache comparison](../bench/n1x/20261123-partition-comparison.md).
+
 It uses eager CUDA launches because sampled requests on the N1X produced non-finite logits
 with captured graphs. The endpoint becomes available after the model loads and warmup completes.
 

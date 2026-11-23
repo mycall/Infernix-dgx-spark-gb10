@@ -41,7 +41,8 @@ $arguments = @(
     '--spec', 'dflash2', '--draft-model', "/draft/$($draftWeights.Name)",
     '--draft-tokens', '3', '--draft-tree-nodes', '0', '--no-cuda-graph',
     '--kv-dtype', 'int8', '--max-context', [string]$MaxContext, '--kv-capacity', [string]$MaxContext,
-    '--host-context-mib', '1024', '--max-concurrency', [string]$MaxConcurrency, '--prefill-chunk', '4096',
+    '--fast-path', 'preemption', '--host-context-mib', '4096',
+    '--max-concurrency', [string]$MaxConcurrency, '--prefill-chunk', '4096', '--pending-timeout-ms', '300000',
     '--default-max-tokens', [string]$DefaultMaxTokens, '--host', '0.0.0.0', '--port', '8002'
 )
 if ($PrintOnly) { $arguments | ConvertTo-Json; return }
