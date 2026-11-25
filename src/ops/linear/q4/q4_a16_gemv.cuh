@@ -59,7 +59,7 @@ template <class Schedule>
 __device__ __forceinline__ float
 q4_gemv_consume_word_tile(const uint4* __restrict__ shared_codes,
                           const std::uint32_t* __restrict__ shared_scale_pairs,
-                          const __nv_bfloat16* __restrict__ activation, int group_begin,
+                          const __nv_bfloat16* activation, int group_begin,
                           int active_groups, int lane, float accumulator) {
     static_assert(Schedule::kLaneMapping == Q4GemvLaneMapping::PackedWord8);
     static_assert(Schedule::kDecodeMode == Q4GemvDecodeMode::Fp16Mantissa);
@@ -104,7 +104,7 @@ q4_gemv_consume_word_tile(const uint4* __restrict__ shared_codes,
 template <class Schedule>
 __device__ __forceinline__ float q4_gemv_dot_word_async(
     Q4GemvTileStorage<Schedule>& shared_tiles, int cta_warp,
-    const __nv_bfloat16* __restrict__ activation, const std::uint8_t* __restrict__ code_row,
+    const __nv_bfloat16* activation, const std::uint8_t* __restrict__ code_row,
     const std::uint8_t* __restrict__ scale_row, int group_begin, int group_end, int lane) {
     constexpr int kGroupsPerTile    = Schedule::kGroupsPerWarpTile;
     constexpr int kStages           = Schedule::kStages;
@@ -159,7 +159,7 @@ __device__ __forceinline__ float q4_gemv_dot_word_async(
 template <class Schedule, int GroupsPerWarp>
 __device__ __forceinline__ float
 q4_gemv_dot_byte_static(Q4GemvTileStorage<Schedule>& shared_tiles, int cta_warp,
-                        const __nv_bfloat16* __restrict__ activation,
+                        const __nv_bfloat16* activation,
                         const std::uint8_t* __restrict__ code_row,
                         const std::uint8_t* __restrict__ scale_row, int group_begin, int lane) {
     static_assert(Schedule::kLaneMapping == Q4GemvLaneMapping::PackedByte2);
@@ -209,7 +209,7 @@ q4_gemv_dot_byte_static(Q4GemvTileStorage<Schedule>& shared_tiles, int cta_warp,
 template <class Schedule>
 __device__ __forceinline__ float q4_gemv_dot_byte_sync(Q4GemvTileStorage<Schedule>& shared_tiles,
                                                        int cta_warp,
-                                                       const __nv_bfloat16* __restrict__ activation,
+                                                       const __nv_bfloat16* activation,
                                                        const std::uint8_t* __restrict__ code_row,
                                                        const std::uint8_t* __restrict__ scale_row,
                                                        int group_begin, int group_end, int lane) {
@@ -282,7 +282,7 @@ __device__ __forceinline__ float q4_gemv_dot_byte_sync(Q4GemvTileStorage<Schedul
 template <class Schedule, class Output, class Epilogue, bool TriggerPdl = false,
           bool JoinPdl = false>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q4_a16_gemv_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const __nv_bfloat16* x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue, std::int32_t rows,
     std::int32_t k, std::int32_t padded_k) {
     // clang-format on

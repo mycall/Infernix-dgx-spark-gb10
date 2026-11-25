@@ -393,6 +393,52 @@ void speculative_accept_sparse_tree(const Tensor& target_tokens, const Tensor& l
         accepted_path, accepted_branch, token_domain, configs, false, scratch, stream);
 }
 
+void speculative_accept_compact_sparse_tree(
+    const Tensor& compact_ids, const Tensor& compact_logits, const Tensor& compact_counts,
+    const Tensor& drafts, const Tensor& candidate_ids, const Tensor& proposal_q,
+    const Tensor& current_extents, const Tensor& tree_rows, Tensor& round_lengths,
+    Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted_drafts, Tensor& accepted_path, Tensor& accepted_branch,
+    std::int32_t token_domain, const SamplingConfig* configs, cudaStream_t stream,
+    const SpeculativeAcceptExecutionEnvelope& execution) {
+    constexpr const char* op = "speculative_accept_compact_sparse_tree";
+    const std::int32_t cap   = compact_ids.ne[0];
+    const std::int32_t k     = drafts.ne[0];
+    const std::int32_t cols  = k + 1;
+    const std::int32_t batch = drafts.ne[1];
+    if (token_domain <= 0) {
+        throw std::invalid_argument("speculative_accept_compact_sparse_tree: token_domain must be positive");
+    }
+    if (cap < 1 || cap > 64 || k < 1 || cols > kSpeculativeTreeMaxNodes || batch < 1 ||
+        batch > kSparseMaxBatch) {
+        throw std::invalid_argument(
+            "speculative_accept_compact_sparse_tree: cap must be in [1,64], W<=32 and B in [1,8]");
+    }
+    require_tensor3(compact_ids, DType::I32, cap, cols, batch, op, "compact_ids");
+    require_tensor3(compact_logits, DType::FP32, cap, cols, batch, op, "compact_logits");
+    require_matrix(compact_counts, DType::I32, cols, batch, op, "compact_counts");
+    require_matrix(drafts, DType::I32, k, batch, op, "drafts");
+    require_tensor3(candidate_ids, DType::I32, kSparseCandidates, k, batch, op, "candidate_ids");
+    require_tensor3(proposal_q, DType::FP32, kSparseCandidates, k, batch, op, "proposal_q");
+    require_vector(current_extents, DType::I32, batch, op, "current_extents");
+    validate_speculative_tree_rows(tree_rows, batch, op);
+    require_vector(round_lengths, DType::I32, batch, op, "round_lengths");
+    require_vector(round_anchors, DType::I32, batch, op, "round_anchors");
+    require_matrix(licensed_tokens, DType::I32, cols, batch, op, "licensed_tokens");
+    require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
+    require_vector(accepted_drafts, DType::I32, batch, op, "accepted_drafts");
+    require_matrix(accepted_path, DType::I32, cols, batch, op, "accepted_path");
+    require_vector(accepted_branch, DType::I32, batch, op, "accepted_branch");
+    if (configs == nullptr) {
+        throw std::invalid_argument("speculative_accept_compact_sparse_tree: configs must be non-null");
+    }
+    detail::speculative_accept_compact_sparse_tree_launch(
+        compact_ids, compact_logits, compact_counts, drafts, candidate_ids, proposal_q,
+        current_extents, tree_rows, round_lengths, round_anchors, licensed_tokens, licensed_counts,
+        accepted_drafts, accepted_path, accepted_branch, token_domain, configs,
+        execution.update_token_counts, stream);
+}
+
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,
                                         cudaStream_t stream) {
     constexpr const char* op = "speculative_select_accepted_hidden";

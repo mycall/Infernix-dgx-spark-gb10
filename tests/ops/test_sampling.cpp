@@ -929,6 +929,171 @@ int increment_counts_contract() {
     return failures;
 }
 
+int combined_branch_gate_contract() {
+    constexpr int rows          = 70;
+    constexpr int domain        = 64;
+    constexpr int words_per_col = (domain + 31) / 32;
+    constexpr int kBranch       = 9;
+    constexpr int kJsonOpen     = 2;
+    constexpr int kContentOpen  = 5;
+    int failures                = 0;
+
+    for (DType dtype : {DType::FP32, DType::BF16}) {
+        // 1. Decode/prefill (cols = 1, batch = 4):
+        //   row 0: v*=5 (masked) > 9 > 2, mask={2,9} -> clears bit 9, samples 2
+        //   row 1: v*=9 (allowed) > 2 > 5, mask={2,9} -> keeps {2,9}, samples 9
+        //   row 2: v*=2 (allowed) > 5 > 9, mask={2,9} -> keeps {2,9}, samples 2
+        //   row 3: v*=5 (masked), mask={9} only -> dead-mask guard keeps {9}, samples 9
+        constexpr int batch = 4;
+        std::vector<float> logits(static_cast<std::size_t>(rows) * batch, -20.0f);
+        auto at = [&](int r, int v) -> float& {
+            return logits[static_cast<std::size_t>(r) * rows + v];
+        };
+        at(0, kContentOpen) = 10.0f;
+        at(0, kBranch)      = 6.0f;
+        at(0, kJsonOpen)    = 4.0f;
+
+        at(1, kBranch)      = 10.0f;
+        at(1, kJsonOpen)    = 4.0f;
+        at(1, kContentOpen) = 2.0f;
+
+        at(2, kJsonOpen)    = 10.0f;
+        at(2, kContentOpen) = 6.0f;
+        at(2, kBranch)      = 4.0f;
+
+        at(3, kContentOpen) = 10.0f;
+        at(3, kBranch)      = 4.0f;
+
+        std::vector<std::uint32_t> host_masks(static_cast<std::size_t>(batch) * words_per_col, 0U);
+        const std::uint32_t both_mask = (1U << kJsonOpen) | (1U << kBranch);
+        const std::uint32_t tool_only = (1U << kBranch);
+        host_masks[0 * words_per_col] = both_mask;
+        host_masks[1 * words_per_col] = both_mask;
+        host_masks[2 * words_per_col] = both_mask;
+        host_masks[3 * words_per_col] = tool_only;
+
+        const std::vector<std::uint8_t> raw_logits = logit_bytes(logits, dtype);
+        DeviceBuffer dev_logits                    = to_device(raw_logits);
+        GuardedDeviceBuffer dev_masks(host_masks.size() * sizeof(std::uint32_t));
+        dev_masks.copy_from_host(host_masks.data(), host_masks.size() * sizeof(std::uint32_t));
+        GuardedDeviceBuffer dev_out(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+        const std::vector<int> positions{1, 2, 3, 4};
+        DeviceBuffer dev_pos = to_device(positions);
+
+        std::vector<ops::SamplingConfig> cfgs(batch);
+        auto* mask_ptr = static_cast<std::uint32_t*>(dev_masks.data());
+        for (int b = 0; b < batch; ++b) {
+            cfgs[static_cast<std::size_t>(b)].mask              = {mask_ptr + b * words_per_col, words_per_col};
+            cfgs[static_cast<std::size_t>(b)].branch_tool_token = kBranch;
+            cfgs[static_cast<std::size_t>(b)].branch_mask_words = mask_ptr + b * words_per_col;
+        }
+        DeviceBuffer dev_cfgs = to_device(cfgs);
+
+        Tensor logits_t(dev_logits.p, dtype, {rows, batch});
+        Tensor out_t(dev_out.data(), DType::I32, {batch});
+        Tensor pos_t(dev_pos.p, DType::I32, {batch});
+        WorkspaceArena workspace(std::max<std::size_t>(256, ops::sampling_workspace_capacity_bytes(domain, batch, batch)));
+
+        ops::filter_combined_branch_masks(logits_t, domain, static_cast<const ops::SamplingConfig*>(dev_cfgs.p), nullptr);
+        const std::vector<std::uint32_t> expected_masks{1U << kJsonOpen, 0U, both_mask, 0U, both_mask, 0U, tool_only, 0U};
+        ops::sample(logits_t, out_t, domain, static_cast<const ops::SamplingConfig*>(dev_cfgs.p), pos_t, ops::kSamplePurposeDecode, workspace, nullptr);
+        cuda_synchronize();
+
+        failures += verify_exact("combined branch gate single-col masks",
+                                 from_device<std::uint32_t>(dev_masks.data(), host_masks.size()), expected_masks);
+        failures += verify_exact("combined branch gate single-col sampled",
+                                 from_device<std::int32_t>(dev_out.data(), batch), {kJsonOpen, kBranch, kJsonOpen, kBranch});
+        failures += dev_masks.verify_guards("combined branch gate single-col mask guards");
+        failures += dev_out.verify_guards("combined branch gate single-col out guards");
+
+        // 2. Penalty interaction (cols = 1, batch = 1):
+        //   raw logits[5]=10.0 penalized by presence_penalty=5.0 -> 5.0 < logits[2]=7.0, so unconstrained
+        //   penalty-adjusted argmax is kJsonOpen (allowed), leaving bit kBranch intact.
+        std::vector<float> pen_logits(rows, -20.0f);
+        pen_logits[kContentOpen] = 10.0f;
+        pen_logits[kJsonOpen]    = 7.0f;
+        pen_logits[kBranch]      = 6.0f;
+        std::vector<std::int32_t> counts(domain, 0);
+        counts[kContentOpen] = 1;
+        DeviceBuffer dev_pen_logits = to_device(logit_bytes(pen_logits, dtype));
+        DeviceBuffer dev_counts     = to_device(counts);
+        GuardedDeviceBuffer dev_pen_masks(static_cast<std::size_t>(words_per_col) * sizeof(std::uint32_t));
+        const std::vector<std::uint32_t> init_pen_masks{both_mask, 0U};
+        dev_pen_masks.copy_from_host(init_pen_masks.data(), init_pen_masks.size() * sizeof(std::uint32_t));
+        ops::SamplingConfig pen_cfg;
+        pen_cfg.presence_penalty  = 5.0f;
+        pen_cfg.token_counts      = static_cast<std::int32_t*>(dev_counts.p);
+        pen_cfg.mask              = {static_cast<const std::uint32_t*>(dev_pen_masks.data()), words_per_col};
+        pen_cfg.branch_tool_token = kBranch;
+        pen_cfg.branch_mask_words = static_cast<std::uint32_t*>(dev_pen_masks.data());
+        DeviceBuffer dev_pen_cfg  = to_device(std::vector<ops::SamplingConfig>{pen_cfg});
+        Tensor pen_logits_t(dev_pen_logits.p, dtype, {rows, 1});
+        ops::filter_combined_branch_masks(pen_logits_t, domain, static_cast<const ops::SamplingConfig*>(dev_pen_cfg.p), nullptr);
+        cuda_synchronize();
+        failures += verify_exact("combined branch gate respects penalties",
+                                 from_device<std::uint32_t>(dev_pen_masks.data(), init_pen_masks.size()), init_pen_masks);
+        failures += dev_pen_masks.verify_guards("combined branch gate penalty guards");
+
+        // 3. Speculative multi-column (K = 2, cols = 3, batch = 2):
+        //   row 0 (extent = 2, drafts={1, 2}): col 0 (v*=5) clears, col 1 (v*=5) clears, col 2 (v*=9) preserves
+        //   row 1 (extent = 1, drafts={9, 1}): col 0 (v*=5) clears, col 1 skips (prior draft 0 == 9), col 2 skips (col > extent)
+        constexpr int K         = 2;
+        constexpr int cols      = K + 1;
+        constexpr int spec_b    = 2;
+        std::vector<float> spec_logits(static_cast<std::size_t>(rows) * cols * spec_b, -20.0f);
+        auto sat = [&](int b, int c, int v) -> float& {
+            return spec_logits[(static_cast<std::size_t>(b) * cols + c) * rows + v];
+        };
+        sat(0, 0, kContentOpen) = 10.0f;
+        sat(0, 0, kBranch)      = 6.0f;
+        sat(0, 0, kJsonOpen)    = 4.0f;
+        sat(0, 1, kContentOpen) = 10.0f;
+        sat(0, 1, kBranch)      = 6.0f;
+        sat(0, 1, kJsonOpen)    = 4.0f;
+        sat(0, 2, kBranch)      = 10.0f;
+        sat(0, 2, kJsonOpen)    = 4.0f;
+        for (int c = 0; c < cols; ++c) {
+            sat(1, c, kContentOpen) = 10.0f;
+            sat(1, c, kBranch)      = 6.0f;
+            sat(1, c, kJsonOpen)    = 4.0f;
+        }
+        std::vector<std::uint32_t> spec_masks(static_cast<std::size_t>(spec_b) * cols * words_per_col, 0U);
+        for (int bc = 0; bc < spec_b * cols; ++bc) {
+            spec_masks[static_cast<std::size_t>(bc) * words_per_col] = both_mask;
+        }
+        DeviceBuffer dev_spec_logits  = to_device(logit_bytes(spec_logits, dtype));
+        DeviceBuffer dev_drafts       = to_device(std::vector<std::int32_t>{1, 2, kBranch, 1});
+        DeviceBuffer dev_extents      = to_device(std::vector<std::int32_t>{2, 1});
+        GuardedDeviceBuffer dev_smasks(spec_masks.size() * sizeof(std::uint32_t));
+        dev_smasks.copy_from_host(spec_masks.data(), spec_masks.size() * sizeof(std::uint32_t));
+        std::vector<ops::SamplingConfig> scfgs(spec_b);
+        auto* smask_ptr = static_cast<std::uint32_t*>(dev_smasks.data());
+        for (int b = 0; b < spec_b; ++b) {
+            auto* row_m = smask_ptr + b * cols * words_per_col;
+            scfgs[static_cast<std::size_t>(b)].mask              = {row_m, words_per_col};
+            scfgs[static_cast<std::size_t>(b)].branch_tool_token = kBranch;
+            scfgs[static_cast<std::size_t>(b)].branch_mask_words = row_m;
+        }
+        DeviceBuffer dev_scfgs = to_device(scfgs);
+
+        Tensor spec_logits_t(dev_spec_logits.p, dtype, {rows, cols, spec_b});
+        Tensor drafts_t(dev_drafts.p, DType::I32, {K, spec_b});
+        Tensor extents_t(dev_extents.p, DType::I32, {spec_b});
+        ops::filter_combined_branch_masks(spec_logits_t, domain,
+                                          static_cast<const ops::SamplingConfig*>(dev_scfgs.p), nullptr,
+                                          drafts_t, extents_t);
+        cuda_synchronize();
+
+        const std::vector<std::uint32_t> expected_spec{
+            1U << kJsonOpen, 0U, 1U << kJsonOpen, 0U, both_mask, 0U,
+            1U << kJsonOpen, 0U, both_mask,       0U, both_mask, 0U};
+        failures += verify_exact("combined branch gate speculative masks",
+                                 from_device<std::uint32_t>(dev_smasks.data(), spec_masks.size()), expected_spec);
+        failures += dev_smasks.verify_guards("combined branch gate speculative mask guards");
+    }
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(sampling) {
@@ -964,6 +1129,7 @@ INFERNIX_OP_TEST(sampling) {
     failures += workspace_route_rng_contract();
     failures += fp32_gumbel_route_contract();
     failures += increment_counts_contract();
+    failures += combined_branch_gate_contract();
     failures += grammar_mask_contract();
     failures += nonfinite_contract();
 

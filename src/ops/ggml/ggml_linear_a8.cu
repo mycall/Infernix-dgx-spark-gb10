@@ -28,7 +28,7 @@ namespace {
 // code words 2c, 2c + 1 and thread 0 the scale (and the code sum where `sums`): a8::column_words' layout,
 // columns `stride` words apart.
 __global__ void __launch_bounds__(kEncodeThreads)
-    encode_kernel(const std::uint16_t* __restrict__ x, int k, const std::int32_t* __restrict__ perm, int perm_block,
+    encode_kernel(const std::uint16_t* x, int k, const std::int32_t* __restrict__ perm, int perm_block,
                   std::int32_t* __restrict__ encoded, int stride, int columns, int sums, int vec) {
     pdl::enter(); // x is the previous kernel's output
     const int slices = k / 32;
@@ -101,7 +101,7 @@ int lanes_for(int slices) {
 // row pointer is offset by s / 8 * 15 blocks (ggml_linear.cu's tiled rows_kernel).
 template <QType F, bool OutF32, int Lanes, bool Tiled>
 __global__ void __launch_bounds__(kRowsThreads)
-    rows_kernel(A8Group g, int slices, const std::int32_t* __restrict__ encoded, int stride, int columns) {
+    rows_kernel(A8Group g, int slices, const std::int32_t* encoded, int stride, int columns) {
     constexpr int kRowsPerWarp        = 32 / Lanes;
     constexpr std::size_t kBlockBytes = ggml_block_bytes(F);
     const Slot seg = slot_at(g, static_cast<int>(blockIdx.x));

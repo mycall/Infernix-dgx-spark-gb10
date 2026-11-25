@@ -420,6 +420,8 @@ public:
           split_reasoning(starts_in_reasoning && !output.raw),
           has_tool_contract(!output.raw && tool_call_output_ != nullptr &&
                             !tool_call_output_->tools.empty()),
+          tool_contract_required(!output.raw && tool_call_output_ != nullptr &&
+                                 tool_call_output_->required),
           collect_open_reasoning(split_reasoning && output.tolerant_tool_calls &&
                                  tool_call_output_ != nullptr &&
                                  !tool_call_output_->constrained && grammar_ == nullptr),
@@ -516,6 +518,7 @@ public:
     bool preserve_special  = false;
     bool split_reasoning   = false;
     bool has_tool_contract = false;
+    bool tool_contract_required = false;
     // Tolerant tool output keeps the open thinking so a turn that ends inside it can still return
     // the calls stranded there; the text is dropped once the thinking closes.
     bool collect_open_reasoning = false;
@@ -612,6 +615,15 @@ runtime::ForbiddenToken OutputSession::forbidden_token() const noexcept {
     }
     return runtime::ForbiddenToken{.token       = impl_->markers.tool_call,
                                    .until_token = impl_->markers.reasoning_close};
+}
+
+TokenId OutputSession::branch_tool_token() const noexcept {
+    if (impl_ == nullptr || !impl_->combined || impl_->tool_contract_required ||
+        impl_->branch != ConstraintOutputBranch::Undecided || !impl_->has_tool_contract ||
+        impl_->grammar == nullptr) {
+        return -1;
+    }
+    return impl_->markers.tool_call;
 }
 
 void OutputSession::observe_constraint(bool timings, double prepare_seconds) noexcept {

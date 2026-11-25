@@ -303,6 +303,8 @@ public:
 
     // FP32 logits [V, n] of batch.logit_columns (or BF16 on the lossless route: head_logits_dtype).
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
+    void run_range(const ForwardBatch& batch, Tensor& logits, std::uint32_t first_layer, std::uint32_t end_layer,
+                   bool do_embed, bool do_finish, const ForwardTap* tap = nullptr);
 
     // The steps run() composes, for a layer walk over a prefill span (design §19.3.8 F4): the
     // same chunks executed layer-major instead of chunk-major. Each step of a chunk starts with

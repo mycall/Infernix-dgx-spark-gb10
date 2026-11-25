@@ -25,8 +25,8 @@ if (-not $PrintOnly) {
     if ($LASTEXITCODE -ne 0) { throw "Could not open WSLC n-gram volume '$NgramVolume'." }
 }
 
-# Captured DFlash2 rounds on N1X/WSLC produced non-finite logits in sampled
-# generation. Eager CUDA keeps K3 draft verification and the model's fast paths.
+# Eager DFlash2 K3 passed the N1X inventory checks at one and four clients.
+# See docs/gb10/20261124-changelog.md for the captured-graph comparison.
 $arguments = @(
     'run', '-d', '--name', $Name, '--gpus', 'all', '--pull', 'never',
     '--mount', "type=bind,source=$($weights.DirectoryName),target=/model,readonly",

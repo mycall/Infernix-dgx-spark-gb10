@@ -319,14 +319,19 @@ void Forward::wait_layer(const ForwardBatch& batch, std::size_t entry) {
 }
 
 void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap) {
+    run_range(batch, logits, 0, config_.num_hidden_layers, true, true, tap);
+}
+
+void Forward::run_range(const ForwardBatch& batch, Tensor& logits, std::uint32_t first_layer, std::uint32_t end_layer,
+                        bool do_embed, bool do_finish, const ForwardTap* tap) {
     begin_call(batch, &logits);
     const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size), S = dim(config_.hc.streams),
                        rank = dim(config_.hc.rank), W = dim(config_.residual_width());
-    Tensor residual         = work_.alloc(DType::BF16, {W, T});
-    embed(batch, residual);
+    Tensor residual = work_.alloc(DType::BF16, {W, T});
+    if (do_embed) { embed(batch, residual); }
     Tensor pre_norm_buf;
-    const Tensor* pre_norm = nullptr;
-    auto can_pre_norm_layer = [&](std::uint32_t next_layer) {
+    const Tensor* pre_norm    = nullptr;
+    auto can_pre_norm_layer   = [&](std::uint32_t next_layer) {
         const auto& next_block = parameters_.layers[next_layer];
         return !next_block.ple &&
                !ops::hyper_connection_mix_is_fused(next_block.attn_hc.down.weight, next_block.attn_hc.up.weight, H,
@@ -340,7 +345,10 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
             }
         }
     }
-    for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) {
+    if (!do_embed && pre_norm_buf.data != nullptr && first_layer > 0 && can_pre_norm_layer(first_layer)) {
+        pre_norm = &pre_norm_buf;
+    }
+    for (std::uint32_t l = first_layer; l < end_layer; ++l) {
         const Tensor* next_norm_weight = nullptr;
         Tensor* next_norm_out          = nullptr;
         if (pre_norm_buf.data != nullptr && l + 1 < config_.num_hidden_layers && can_pre_norm_layer(l + 1)) {
@@ -350,7 +358,7 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
         layer(l, batch, residual, tap, pre_norm, next_norm_weight, next_norm_out);
         pre_norm = next_norm_out;
     }
-    finish(batch, residual, &logits);
+    if (do_finish) { finish(batch, residual, &logits); }
 }
 
 void Forward::embed(const ForwardBatch& batch, Tensor& residual) {

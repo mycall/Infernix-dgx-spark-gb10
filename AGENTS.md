@@ -94,9 +94,22 @@ Keep stable requirements in their existing active reference. Temporary plans are
 active work; remove them when completed or abandoned. Maintain one current authority rather than
 parallel `final`, `v2`, or `new-design` documents.
 
+### Upstream syncs on the N1X fork
+
+On the long-lived `n1x` branch, `origin` is the N1X fork and `upstream` is
+`eugene-kamenev/Infernix-dgx-spark-gb10`. For a full sync, fetch `upstream/main` and merge it
+directly into `n1x`. The merge records the GB10 tip as an ancestor for future syncs. Reserve
+cherry-picks for a deliberately selective backport. Other branches and the fork's `main` can
+stay at their own revisions. Verify a completed full sync with
+`git merge-base --is-ancestor upstream/main n1x`.
+
+Resolve conflicts against both the incoming engine changes and the N1X WSLC serving contract.
+Use the [N1X refresh recipe](bench/n1x/README.md#refreshing-from-upstream) and check the affected
+paths on N1X before publishing. Record both parent revisions in the dated GB10 changelog.
+
 ### GB10 branch changelog and rebase tracking (`docs/gb10/`)
 
-To support ongoing and future rebases onto upstream (`origin/main`) while preserving GB10 (`sm_121a`)
+To support the GB10 project's ongoing rebases onto its own upstream while preserving GB10 (`sm_121a`)
 architectural adaptations, maintain dated changelog files in `docs/gb10/` following the pattern:
 
 ```text

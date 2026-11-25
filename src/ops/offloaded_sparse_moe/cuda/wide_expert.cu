@@ -985,6 +985,35 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     return call;
 }
 
+void prepare_xplane(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
+                    std::int32_t top_k, std::int32_t max_jobs, std::int32_t pass_jobs,
+                    const ExpertsWorkspace& workspace, cudaStream_t stream) {
+    const int tokens  = static_cast<int>(x.ne[1]);
+    const int entries = tokens * top_k;
+    const int passes  = (max_jobs + pass_jobs - 1) / pass_jobs;
+    const bool cpu    = source.cpu.max_jobs > 0 && tokens <= source.cpu.max_columns;
+    plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source, max_jobs, pass_jobs, passes,
+                                                cpu ? workspace.cpu_flags : nullptr, workspace.job_records,
+                                                workspace.tiles, workspace.pass_tiles, workspace.narrow_jobs,
+                                                workspace.pass_narrow, workspace.entry_map, entries * 2);
+    check_launch("plan xplane");
+    const int map_blocks = std::max(1, std::min<int>(max_jobs, persistent_ctas()));
+    map_entries_kernel<<<map_blocks, kQuantizeThreads, 0, stream>>>(dispatch, workspace.pass_tiles,
+                                                                    workspace.pass_narrow, passes, workspace.entry_map);
+    if (tokens <= 64) {
+        quantize_token_small_kernel<<<dim3(tokens, top_k), kGateUpBlocks, 0, stream>>>(
+            static_cast<const std::uint16_t*>(x.data), top_k, source.scales, workspace.pass_tiles,
+            workspace.pass_narrow, passes, workspace.entry_map, workspace.x_plane);
+    } else {
+        constexpr int kWarps     = kQuantizeThreads / 32;
+        const int token_blocks   = std::max(1, std::min<int>(persistent_ctas() * 2, (tokens + kWarps - 1) / kWarps));
+        quantize_token_kernel<<<token_blocks, kQuantizeThreads, 0, stream>>>(
+            static_cast<const std::uint16_t*>(x.data), top_k, tokens, source.scales, workspace.pass_tiles,
+            workspace.pass_narrow, passes, workspace.entry_map, workspace.x_plane);
+    }
+    check_launch("quantize xplane");
+}
+
 // The W4A4 and A4-residual grouped GEMMs on WarpTile64 schedules (the same bits) from
 // kWarpTile64MinColumns columns per expert on average.
 bool wide_t64(const Call& call) { return call.mean_job_columns >= kWarpTile64MinColumns; }

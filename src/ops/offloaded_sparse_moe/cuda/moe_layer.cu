@@ -290,7 +290,7 @@ constexpr int kMaxPassJobs = 512;
 // last one (when bytes.consume).
 __global__ void __launch_bounds__(kThreads)
     stage_kernel(MoeDispatch dispatch, MoeExpertSource source, int job_base, int pass_jobs,
-                 const std::int32_t* __restrict__ cpu_flags, const std::uint8_t** __restrict__ job_records,
+                 const std::int32_t* cpu_flags, const std::uint8_t** __restrict__ job_records,
                  FetchCall* __restrict__ fetch, StageBytes bytes) {
     __shared__ int miss_jobs[kMaxPassJobs];
     __shared__ std::uint8_t* miss_dst[kMaxPassJobs];
@@ -1175,7 +1175,7 @@ __device__ __forceinline__ void quantize_a4_words_from_bf16(const uint4* src, fl
 // reading them as sixteen 2-byte loads cost one 32-byte sector each (ncu: 59% of this kernel's
 // global sectors were excessive), which is what exposed the fabric latency on `stall_long_sb`.
 // The unpacked values are identical, so every quantized block keeps its bits.
-__device__ void quantize_column_codes(const bf16* __restrict__ x, int hidden, const std::int32_t* entries, int first,
+__device__ void quantize_column_codes(const bf16* x, int hidden, const std::int32_t* entries, int first,
                                       int top_k, float scale, ActCodes* acts, int blocks, int b0 = 0) {
     const int t = entries[first] / top_k;
     for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
@@ -1194,7 +1194,7 @@ __device__ void quantize_column_codes(const bf16* __restrict__ x, int hidden, co
 }
 
 template <int B0, int BLen>
-__device__ __forceinline__ void quantize_pair_half_codes(const bf16* __restrict__ x, int hidden, int t0, int t1,
+__device__ __forceinline__ void quantize_pair_half_codes(const bf16* x, int hidden, int t0, int t1,
                                                          float scale, ActCodes* __restrict__ acts) {
     static_assert(2 * BLen <= kThreads && (2 * BLen) % 32 == 0);
     const int idx = static_cast<int>(threadIdx.x);
@@ -1277,7 +1277,7 @@ __device__ __forceinline__ void quantize_split_words_from_bf16(const uint4* src,
 // Quantizes blocks [0, blocks) of one column of entry `first` under both `gate_scale` (low nibbles)
 // and `up_scale` (high nibbles) into `acts`. Each thread `b < blocks` loads its 16 BF16 elements once
 // and encodes both scales together via `quantize_split_words_from_bf16`.
-__device__ void quantize_split_codes(const bf16* __restrict__ x, int hidden, const std::int32_t* entries, int first,
+__device__ void quantize_split_codes(const bf16* x, int hidden, const std::int32_t* entries, int first,
                                      int top_k, float gate_scale, float up_scale, ActCodes* acts, int blocks,
                                      int b0 = 0) {
     const int t = entries[first] / top_k;
@@ -1297,7 +1297,7 @@ __device__ void quantize_split_codes(const bf16* __restrict__ x, int hidden, con
 // and transposes with its partner lane `tid ^ 1` so `col = 0` writes `(col0_gate, col1_gate)` to
 // `acts[2 * db + 0]` and `col = 1` writes `(col0_up, col1_up)` to `acts[2 * db + 1]`.
 template <int B0, int BLen>
-__device__ __forceinline__ void quantize_split_pair_half(const bf16* __restrict__ x, int hidden, int t0, int t1,
+__device__ __forceinline__ void quantize_split_pair_half(const bf16* x, int hidden, int t0, int t1,
                                                          float gate_scale, float up_scale, ActCodes* acts) {
     static_assert(2 * BLen <= kThreads && (2 * BLen) % 32 == 0);
     const int tid = static_cast<int>(threadIdx.x);
@@ -1409,7 +1409,7 @@ struct DownActCodes {
 };
 
 template <int B0, int BLen>
-__device__ __forceinline__ void quantize_quad_half_codes(const bf16* __restrict__ x, int hidden, int t0, int t1, int t2,
+__device__ __forceinline__ void quantize_quad_half_codes(const bf16* x, int hidden, int t0, int t1, int t2,
                                                          int t3, float scale, DownActCodes* __restrict__ acts) {
     static_assert(4 * BLen % 32 == 0);
     for (int idx = static_cast<int>(threadIdx.x); idx < 4 * BLen; idx += kThreads) {
@@ -1624,7 +1624,7 @@ __device__ __forceinline__ void stage_xplane_chunk(const std::uint8_t* x_plane, 
     }
 }
 
-__device__ __forceinline__ void quantize_split_chunk_xplane(const bf16* __restrict__ x, int hidden,
+__device__ __forceinline__ void quantize_split_chunk_xplane(const bf16* x, int hidden,
                                                           const MoeDispatch& dispatch, int first, int count, int top_k,
                                                           const moe::ExpertScales& scales, int chunk,
                                                           XPlaneChunk& gate_dst, XPlaneChunk& up_dst) {
@@ -1792,9 +1792,9 @@ __device__ __forceinline__ void emit_gate_up_cols(int warp, int lane, int first,
 }
 
 __global__ void __launch_bounds__(kThreads, 3)
-    gate_up_kernel_one(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch,
-                       MoeExpertSource source, int top_k, const std::uint8_t* const* __restrict__ job_records,
-                       const std::int32_t* __restrict__ cpu_flags, int job_base,
+    gate_up_kernel_one(const bf16* x, int hidden, MoeDispatch dispatch,
+                       MoeExpertSource source, int top_k, const std::uint8_t* const* job_records,
+                       const std::int32_t* cpu_flags, int job_base,
                        canon::A4Block* __restrict__ h_blocks, PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm        = *reinterpret_cast<GateUpOneShared*>(smem_raw);
@@ -1868,9 +1868,9 @@ __global__ void __launch_bounds__(kThreads, 3)
 }
 
 __global__ void __launch_bounds__(kThreads, 3)
-    gate_up_kernel(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch,
-                   MoeExpertSource source, int top_k, const std::uint8_t* const* __restrict__ job_records,
-                   const std::int32_t* __restrict__ cpu_flags, int job_base, canon::A4Block* __restrict__ h_blocks,
+    gate_up_kernel(const bf16* x, int hidden, MoeDispatch dispatch,
+                   MoeExpertSource source, int top_k, const std::uint8_t* const* job_records,
+                   const std::int32_t* cpu_flags, int job_base, canon::A4Block* __restrict__ h_blocks,
                    PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm        = *reinterpret_cast<GateUpShared*>(smem_raw);
@@ -2046,10 +2046,10 @@ __device__ __forceinline__ void emit_gate_up_cols_xplane(
 }
 
 __global__ void __launch_bounds__(kThreads, 4)
-    gate_up_xplane_kernel(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch, MoeExpertSource source,
-                          int top_k, const std::uint8_t* const* __restrict__ job_records,
-                          const std::int32_t* __restrict__ narrow_jobs, const std::int32_t* __restrict__ pass_narrow,
-                          int pass, const std::uint8_t* __restrict__ x_plane, canon::A4Block* __restrict__ h_blocks) {
+    gate_up_xplane_kernel(const bf16* x, int hidden, MoeDispatch dispatch, MoeExpertSource source,
+                          int top_k, const std::uint8_t* const* job_records,
+                          const std::int32_t* narrow_jobs, const std::int32_t* pass_narrow,
+                          int pass, const std::uint8_t* x_plane, canon::A4Block* __restrict__ h_blocks) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm = *reinterpret_cast<GateUpXPlaneShared*>(smem_raw);
     if (source.staging_slots == 0 && source.fetch.request == nullptr) { pdl::enter(); }
@@ -2229,8 +2229,8 @@ static_assert(3 * (sizeof(DownShared) + 1024) <= 101376, "three down CTAs must f
 
 __global__ void __launch_bounds__(kThreads, 3)
     down_kernel(MoeDispatch dispatch, MoeExpertSource source, int hidden,
-                const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
-                int job_base, const canon::A4Block* __restrict__ h_blocks, bf16* __restrict__ outputs,
+                const std::uint8_t* const* job_records, const std::int32_t* cpu_flags,
+                int job_base, const canon::A4Block* h_blocks, bf16* __restrict__ outputs,
                 PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm      = *reinterpret_cast<DownShared*>(smem_raw);
@@ -2368,7 +2368,7 @@ __device__ __forceinline__ void stage_down_chunk(const std::uint8_t* record_slic
     }
 }
 
-__device__ __forceinline__ void stage_packed_h(const canon::A4Block* __restrict__ h_blocks, int first_col, int count,
+__device__ __forceinline__ void stage_packed_h(const canon::A4Block* h_blocks, int first_col, int count,
                                                PackedHRow (&dst)[moe::kMaxColumns]) {
     constexpr int kVecsPerRow = kPackedHRowBytes / 16; // 23
     const int total_vecs      = count * kVecsPerRow;
@@ -2440,9 +2440,9 @@ static_assert(4 * (sizeof(DownPrefillShared) + 1024) <= 101376, "four prefill do
 
 __global__ void __launch_bounds__(kThreads, 4)
     down_prefill_kernel(MoeDispatch dispatch, MoeExpertSource source, int hidden,
-                        const std::uint8_t* const* __restrict__ job_records,
-                        const std::int32_t* __restrict__ narrow_jobs, const std::int32_t* __restrict__ pass_narrow,
-                        int pass, const canon::A4Block* __restrict__ h_blocks, bf16* __restrict__ outputs) {
+                        const std::uint8_t* const* job_records,
+                        const std::int32_t* narrow_jobs, const std::int32_t* pass_narrow,
+                        int pass, const canon::A4Block* h_blocks, bf16* __restrict__ outputs) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm              = *reinterpret_cast<DownPrefillShared*>(smem_raw);
     const int n_begin     = pass_narrow[pass];
@@ -2928,10 +2928,10 @@ static_assert(kGateUpMinBlocksOf<moe::FlashNextExperts, kA16PassColumns> == 2,
               "two Flash-Next A16 gate/up CTAs must fit an SM");
 
 template <class G, int Columns>
-__device__ __forceinline__ void gate_up_a16_body(const bf16* __restrict__ x, int hidden, const MoeDispatch& dispatch,
+__device__ __forceinline__ void gate_up_a16_body(const bf16* x, int hidden, const MoeDispatch& dispatch,
                                                  const MoeExpertSource& source, int top_k,
-                                                 const std::uint8_t* const* __restrict__ job_records,
-                                                 const std::int32_t* __restrict__ cpu_flags, int job_base,
+                                                 const std::uint8_t* const* job_records,
+                                                 const std::int32_t* cpu_flags, int job_base,
                                                  std::uint16_t* __restrict__ h_plane, PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm      = *reinterpret_cast<GateUpShared16<G, Columns>*>(smem_raw);
@@ -2991,9 +2991,9 @@ __device__ __forceinline__ void gate_up_a16_body(const bf16* __restrict__ x, int
 
 template <class G, int Columns>
 __global__ void __launch_bounds__(kThreads, kGateUpMinBlocksOf<G, Columns>)
-    gate_up_kernel_a16(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch, MoeExpertSource source,
-                       int top_k, const std::uint8_t* const* __restrict__ job_records,
-                       const std::int32_t* __restrict__ cpu_flags, int job_base, std::uint16_t* __restrict__ h_plane,
+    gate_up_kernel_a16(const bf16* x, int hidden, MoeDispatch dispatch, MoeExpertSource source,
+                       int top_k, const std::uint8_t* const* job_records,
+                       const std::int32_t* cpu_flags, int job_base, std::uint16_t* __restrict__ h_plane,
                        PassPhase phase) {
     gate_up_a16_body<G, Columns>(x, hidden, dispatch, source, top_k, job_records, cpu_flags, job_base, h_plane, phase);
 }
@@ -3014,8 +3014,8 @@ static_assert(kDownMinBlocksOf<moe::FlashNextExperts, kA16PassColumns> == 3,
 template <class G, int Columns>
 __global__ void __launch_bounds__(kThreads, kDownMinBlocksOf<G, Columns>)
     down_kernel_a16(MoeDispatch dispatch, MoeExpertSource source, int hidden,
-                    const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
-                    int job_base, const std::uint16_t* __restrict__ h_plane, bf16* __restrict__ outputs,
+                    const std::uint8_t* const* job_records, const std::int32_t* cpu_flags,
+                    int job_base, const std::uint16_t* h_plane, bf16* __restrict__ outputs,
                     PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm      = *reinterpret_cast<DownShared16<G, Columns>*>(smem_raw);
@@ -3346,7 +3346,7 @@ static_assert(sizeof(GateUpSharedA4r) + 1024 <= 102400 / 2, "two two-term gate/u
 
 // The column pairs of a two-term gate/up CTA's job (count >= 2 columns), as the one-column loop below
 // computes each column.
-__device__ void gate_up_pairs_a4r(const bf16* __restrict__ x, const MoeDispatch& dispatch, int top_k,
+__device__ void gate_up_pairs_a4r(const bf16* x, const MoeDispatch& dispatch, int top_k,
                                   const moe::ExpertScales& scales, int first, int count, int slice,
                                   std::uint16_t* __restrict__ h_plane, GateUpSharedA4r& sm) {
     constexpr int kHalf = moe::kGateUpBlocks / 2;
@@ -3405,8 +3405,8 @@ __device__ void gate_up_pairs_a4r(const bf16* __restrict__ x, const MoeDispatch&
 
 template <bool Pairs>
 __global__ void __launch_bounds__(kThreads, 2)
-    gate_up_kernel_a4r(const bf16* __restrict__ x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
-                       const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
+    gate_up_kernel_a4r(const bf16* x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
+                       const std::uint8_t* const* job_records, const std::int32_t* cpu_flags,
                        int job_base, std::uint16_t* __restrict__ h_plane, PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm      = *reinterpret_cast<GateUpSharedA4r*>(smem_raw);
@@ -3474,7 +3474,7 @@ struct DownSharedA4r {
 // The column pairs of a two-term down CTA's job (count >= 2 columns), as the one-column loop below
 // computes each column.
 __device__ void down_pairs_a4r(const MoeDispatch& dispatch, const moe::ExpertScales& scales, int first, int count,
-                               int tile, const std::uint16_t* __restrict__ h_plane, bf16* __restrict__ outputs,
+                               int tile, const std::uint16_t* h_plane, bf16* __restrict__ outputs,
                                DownSharedA4r& sm) {
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     for (int c0 = 0; c0 < count; c0 += 2) {
@@ -3517,8 +3517,8 @@ static_assert(3 * (sizeof(DownSharedA4r) + 1024) <= 101376, "three two-term down
 
 template <bool Pairs>
 __global__ void __launch_bounds__(kThreads, Pairs ? 2 : 3)
-    down_kernel_a4r(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* __restrict__ job_records,
-                    const std::int32_t* __restrict__ cpu_flags, int job_base, const std::uint16_t* __restrict__ h_plane,
+    down_kernel_a4r(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* job_records,
+                    const std::int32_t* cpu_flags, int job_base, const std::uint16_t* h_plane,
                     bf16* __restrict__ outputs, PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm       = *reinterpret_cast<DownSharedA4r*>(smem_raw);
@@ -3782,7 +3782,7 @@ struct CpuPlanShared {
 // chunk.
 template <bool Named>
 __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const MoeExpertSource& source,
-                                              const bf16* __restrict__ x, int columns, int top_k, int max_jobs,
+                                              const bf16* x, int columns, int top_k, int max_jobs,
                                               std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call,
                                               CpuPlanShared& sm) {
     constexpr int kWidths = CpuPlanShared::kWidths;
@@ -4016,7 +4016,7 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
 // The CPU plan of one call.
 template <bool Named>
 __device__ __forceinline__ void cpu_plan(const MoeDispatch& dispatch, const MoeExpertSource& source,
-                                         const bf16* __restrict__ x, int columns, int top_k, int max_jobs,
+                                         const bf16* x, int columns, int top_k, int max_jobs,
                                          std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call) {
     static_assert(CpuPlanShared::kChunks * kThreads >= kDispatchThreads, "a call's jobs fit the plan's chunks");
     __shared__ CpuPlanShared sm;
@@ -4024,7 +4024,7 @@ __device__ __forceinline__ void cpu_plan(const MoeDispatch& dispatch, const MoeE
 }
 
 __global__ void __launch_bounds__(kThreads)
-    cpu_plan_kernel(MoeDispatch dispatch, MoeExpertSource source, const bf16* __restrict__ x, int columns,
+    cpu_plan_kernel(MoeDispatch dispatch, MoeExpertSource source, const bf16* x, int columns,
                     int top_k, int max_jobs, std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call) {
     pdl::enter(); // launched as a programmatic dependent of the dispatch
     cpu_plan<false>(dispatch, source, x, columns, top_k, max_jobs, cpu_flags, call);
@@ -4132,7 +4132,7 @@ __global__ void __launch_bounds__(kThreads)
 
 // The fused route's x for the CPU channel: every column at its own index (the request names columns
 // by their index), by threads [first, first + count) of the CTA.
-__device__ __forceinline__ void publish_x_columns(const MoeCpuChannel& channel, const bf16* __restrict__ x, int hidden,
+__device__ __forceinline__ void publish_x_columns(const MoeCpuChannel& channel, const bf16* x, int hidden,
                                                   int columns, int first, int count) {
     const int vectors = hidden * 2 / 16;
     const auto* src   = reinterpret_cast<const int4*>(x);
@@ -4168,7 +4168,7 @@ __global__ void __launch_bounds__(kDispatchThreads)
                                float* __restrict__ weights,
                                float* __restrict__ shared_gate, MoeDispatch dispatch,
                                std::int32_t* __restrict__ route_log, MoeExpertSource source,
-                               const bf16* __restrict__ x, int max_jobs, std::int32_t* __restrict__ cpu_flags,
+                               const bf16* x, int max_jobs, std::int32_t* __restrict__ cpu_flags,
                                CpuCall* __restrict__ call, FetchCall* __restrict__ fetch, MoeColumnMask mask) {
     __shared__ RouteDispatchPlanShared sm;
     pdl::enter(); // launched as a programmatic dependent of the router projection
@@ -4234,7 +4234,7 @@ __device__ void warm_l2(const MoeL2Warm& warm, int w) {
 // Tail skip (MoeExpertSource::tail_skip_rank): no route writes a skipped expert's outputs, so they are
 // zeroed for the combine. CTA b clears the entries of jobs b, b + gridDim.x, ... flagged 2.
 __global__ void __launch_bounds__(kThreads)
-    tail_zero_kernel(MoeDispatch dispatch, int max_jobs, const std::int32_t* __restrict__ cpu_flags, int hidden,
+    tail_zero_kernel(MoeDispatch dispatch, int max_jobs, const std::int32_t* cpu_flags, int hidden,
                      bf16* __restrict__ outputs) {
     const int jobs    = min(*dispatch.job_count, max_jobs);
     const int vectors = hidden * 2 / 16; // 16-byte vectors per column
@@ -5134,7 +5134,15 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
         return;
     }
+    const bool omma_xplane =
+        !use_wide && source.omma_narrow && !ggml && !nvfp4_a8 && source.activation == moe::ExpertActivation::kA4 &&
+        source.shape == moe::kFlashNextShape && x.ne[1] >= 2 && x.ne[1] <= moe::kMaxColumns &&
+        outputs.ne[1] == static_cast<int>(x.ne[1]) * top_k && layout.entry_map != nullptr &&
+        layout.narrow_jobs != nullptr && layout.pass_narrow != nullptr && layout.x_plane != nullptr;
     if (use_wide) { wide = moe::wide::prepare(x, dispatch, source, top_k, max_jobs, pass_jobs, layout, outputs, stream); }
+    if (omma_xplane) {
+        moe::wide::prepare_xplane(x, dispatch, source, top_k, max_jobs, pass_jobs, layout, stream);
+    }
     MoeExpertSource unlanded = source; // landing is for forked calls only
     unlanded.landing         = nullptr;
     unlanded.landing_slots   = 0;
@@ -5149,9 +5157,9 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                                             stage_kernel, dispatch, unlanded, base, jobs, flags, job_records, fetch,
                                             StageBytes{}));
         }
-        const bool use_xplane = use_wide && (outputs.ne[1] == static_cast<int>(x.ne[1]) * top_k) &&
-                                layout.entry_map != nullptr && layout.narrow_jobs != nullptr &&
-                                layout.pass_narrow != nullptr && layout.x_plane != nullptr;
+        const bool use_xplane = omma_xplane || (use_wide && (outputs.ne[1] == static_cast<int>(x.ne[1]) * top_k) &&
+                                                layout.entry_map != nullptr && layout.narrow_jobs != nullptr &&
+                                                layout.pass_narrow != nullptr && layout.x_plane != nullptr);
         launch_pass(x.ne[1], static_cast<const bf16*>(x.data), dispatch, source, top_k, job_records, flags, base, jobs,
                     layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream, PassPhase::All,
                     PassPart::Both, base / pass_jobs, use_xplane);

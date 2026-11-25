@@ -87,6 +87,10 @@ public:
             return outputs[row] ? outputs[row]->forbidden_token() : ForbiddenToken{};
         }
 
+        TokenId branch_tool_token(std::size_t row) const noexcept override {
+            return outputs[row] ? outputs[row]->branch_tool_token() : -1;
+        }
+
         std::uint64_t fill(std::size_t row, std::span<const TokenId> drafts,
                            std::span<std::uint32_t> words) override {
             return outputs[row]->grammar_masks(drafts, words);

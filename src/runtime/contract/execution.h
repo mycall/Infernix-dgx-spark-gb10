@@ -72,6 +72,9 @@ public:
     [[nodiscard]] virtual ForbiddenToken forbidden_token(std::size_t /*row*/) const noexcept {
         return {};
     }
+    [[nodiscard]] virtual TokenId branch_tool_token(std::size_t /*row*/) const noexcept {
+        return -1;
+    }
     // Returns dead-end position bits. Even dead/unreachable positions receive a safe nonempty
     // device mask. A dead end fails a row only if verification reaches that position.
     [[nodiscard]] virtual std::uint64_t fill(std::size_t row, std::span<const TokenId> drafts,

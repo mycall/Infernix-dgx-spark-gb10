@@ -2255,6 +2255,273 @@ int gdn_record_case(int value_heads, const std::vector<ops::SpeculativeTreeRow>&
     return failures;
 }
 
+int compact_tree_case() {
+    constexpr int k = 8, n = k + 1, batch = 8, cap = 64;
+    const ops::SpeculativeTreeRow side_tree =
+        host_row(branched_parents(4, {{0, 2}, {1, 2}}), 4, true); // 9 nodes, side branches 5-6, 7-8
+    ops::SpeculativeTreeRow transport_tree = side_tree;
+    transport_tree.transport               = 1;
+    transport_tree.sampled                 = (1U << 5) | (1U << 6) | (1U << 7) | (1U << 8);
+    const std::vector<ops::SpeculativeTreeRow> rows{
+        side_tree,      // 0: sampled tree
+        transport_tree, // 1: UniVer transport tree
+        side_tree,      // 2: gumbel_max tree
+        chain_row(5, k),// 3: sampled chain with penalties + token_counts
+        side_tree,      // 4: sampled tree with penalties + forbidden + token_counts
+        side_tree,      // 5: raw greedy tree (walks side branch)
+        side_tree,      // 6: greedy tree with penalties
+        chain_row(4, k),// 7: raw greedy chain (walks chain, accepted_branch == -1)
+    };
+    auto tree_rows = upload_rows(rows);
+
+    AcceptBuffers oracle(n, batch), compact(n, batch);
+    GuardedDeviceBuffer d_cids(sizeof(std::int32_t) * cap * n * batch);
+    GuardedDeviceBuffer d_clogits(sizeof(float) * cap * n * batch);
+    GuardedDeviceBuffer d_ccounts(sizeof(std::int32_t) * n * batch);
+    GuardedDeviceBuffer d_counts_compact(sizeof(std::int32_t) * kTokenDomain);
+    GuardedDeviceBuffer d_nonfinite_oracle(sizeof(std::int32_t) * batch);
+    GuardedDeviceBuffer d_nonfinite_compact(sizeof(std::int32_t) * batch);
+
+    std::mt19937_64 rng(0x51A7BEEFULL);
+    std::uniform_real_distribution<float> uniform(0.0F, 1.0F);
+    const std::uint16_t kNegInfBf16 = 0xff80U;
+    std::vector<std::uint16_t> bf16_logits(static_cast<std::size_t>(kPhysicalRows) * n * batch, kNegInfBf16);
+    std::vector<std::int32_t> compact_ids(static_cast<std::size_t>(cap) * n * batch, -1);
+    std::vector<float> compact_logits(static_cast<std::size_t>(cap) * n * batch, 0.0F);
+    std::vector<std::int32_t> compact_counts(static_cast<std::size_t>(n) * batch, 0);
+    std::vector<int> drafts(static_cast<std::size_t>(k) * batch, 0);
+    std::vector<int> candidates(static_cast<std::size_t>(kCandidates) * k * batch, 0);
+    std::vector<float> q(candidates.size(), 0.0F);
+    std::vector<int> targets(static_cast<std::size_t>(n) * batch, 0);
+
+    for (int r = 0; r < batch; ++r) {
+        // Proposal candidates & normalized q per child column
+        for (int c = 0; c < k; ++c) {
+            const std::size_t at = static_cast<std::size_t>(r) * k + c;
+            std::set<int> used;
+            float total = 0.0F;
+            for (int j = 0; j < kCandidates; ++j) {
+                int id = 0;
+                do {
+                    id = 1000 + static_cast<int>(rng() % 64U);
+                } while (!used.insert(id).second);
+                candidates[at * kCandidates + j] = id;
+                q[at * kCandidates + j]          = 0.02F + uniform(rng);
+                total += q[at * kCandidates + j];
+            }
+            for (int j = 0; j < kCandidates; ++j) q[at * kCandidates + j] /= total;
+            float u = uniform(rng), acc = 0.0F;
+            int drawn = 0;
+            for (int j = 0; j < kCandidates; ++j) {
+                acc += q[at * kCandidates + j];
+                if (u < acc) {
+                    drawn = j;
+                    break;
+                }
+            }
+            drafts[at] = candidates[at * kCandidates + drawn];
+        }
+        // Populate matching branch paths on raw greedy rows 5 and 7
+        if (r == 5) {
+            drafts[r * k + 4] = 2001; // node 5 child of root
+            drafts[r * k + 5] = 2002; // node 6 child of node 5
+        } else if (r == 7) {
+            drafts[r * k + 0] = 2101;
+            drafts[r * k + 1] = 2102;
+        }
+
+        const int live = rows[r].nodes;
+        for (int c = 0; c < live; ++c) {
+            const int m = (c == 0 && (r == 0 || r == 5)) ? 12 : (24 + ((r * 7 + c * 11) % 41));
+            std::vector<int> active;
+            active.reserve(static_cast<std::size_t>(m));
+            std::set<int> seen;
+            // Ensure key tokens appear so draws & greedy paths exercise acceptance and penalties
+            const auto add_tok = [&](int tok) {
+                if (static_cast<int>(active.size()) < m && tok >= 0 && tok < kTokenDomain &&
+                    seen.insert(tok).second) {
+                    active.push_back(tok);
+                }
+            };
+            if (r == 4) add_tok(1002);
+            if (r == 5 && c == 0) add_tok(2001);
+            if (r == 5 && c == 5) { add_tok(2002); add_tok(2099); }
+            if (r == 7 && c == 0) add_tok(2101);
+            if (r == 7 && c == 1) { add_tok(2102); add_tok(2199); }
+            for (int s = rows[r].first_child[c]; s >= 0; s = rows[r].next_sibling[s]) {
+                add_tok(drafts[r * k + s - 1]);
+            }
+            while (static_cast<int>(active.size()) < m) {
+                add_tok(950 + static_cast<int>(rng() % 120U));
+            }
+            std::shuffle(active.begin(), active.end(), rng);
+            const std::size_t d_base = (static_cast<std::size_t>(r) * n + c) * kPhysicalRows;
+            const std::size_t c_base = (static_cast<std::size_t>(r) * n + c) * cap;
+            compact_counts[r * n + c] = m;
+            int best_tok = 0;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < m; ++i) {
+                const int tok = active[i];
+                float raw     = -2.0F + 5.0F * uniform(rng);
+                if ((r == 5 && ((c == 0 && tok == 2001) || (c == 5 && tok == 2002) || (c == 6 && i == 0))) ||
+                    (r == 7 && ((c == 0 && tok == 2101) || (c == 1 && tok == 2102) || (c == 2 && i == 0)))) {
+                    raw = 9.0F;
+                }
+                const std::uint16_t bf = f32_to_bf16(raw);
+                const float exact_v    = bf16_to_f32(bf);
+                bf16_logits[d_base + tok] = bf;
+                compact_ids[c_base + i]    = tok;
+                compact_logits[c_base + i] = exact_v;
+                if (exact_v > best_val || (exact_v == best_val && tok < best_tok)) {
+                    best_val = exact_v;
+                    best_tok = tok;
+                }
+            }
+            targets[r * n + c] = best_tok;
+        }
+    }
+
+    std::vector<ops::SamplingConfig> configs_o(batch), configs_c(batch);
+    const std::array<float, batch> temps{0.85F, 1.0F, 1.0F, 0.9F, 0.95F, 0.0F, 0.0F, 0.0F};
+    std::vector<std::int32_t> init_counts(kTokenDomain, 0);
+    for (int i = 950; i < 1100; ++i) init_counts[i] = i % 3;
+    d_counts_compact.copy_from_host(init_counts.data(), init_counts.size() * sizeof(std::int32_t));
+    d_nonfinite_oracle.fill(0);
+    d_nonfinite_compact.fill(0);
+    auto* counts_dev   = static_cast<std::int32_t*>(d_counts_compact.data());
+    auto* nf_oracle    = static_cast<std::int32_t*>(d_nonfinite_oracle.data());
+    auto* nf_compact   = static_cast<std::int32_t*>(d_nonfinite_compact.data());
+
+    for (int r = 0; r < batch; ++r) {
+        auto init_cfg = [&](ops::SamplingConfig& c, std::int32_t* tc, std::int32_t* nf) {
+            c.temperature       = temps[r];
+            c.top_k             = r == 1 ? 32 : 20;
+            c.top_p             = r == 0 ? 0.9F : (r == 1 ? 0.95F : 1.0F);
+            c.min_p             = r == 0 ? 0.05F : 0.0F;
+            c.gumbel_max        = (r == 2);
+            c.seed              = 0xCAFEBABE00ULL + static_cast<std::uint64_t>(r) * 17ULL;
+            c.presence_penalty  = (r == 3) ? 0.4F : (r == 4 ? 0.5F : (r == 6 ? 0.6F : 0.0F));
+            c.frequency_penalty = (r == 3) ? 0.3F : (r == 4 ? 0.25F : 0.0F);
+            c.forbidden_token   = (r == 4) ? 1002 : -1;
+            c.forbidden_until_token = (r == 4) ? drafts[r * k] : -1;
+            c.token_counts      = tc;
+            c.nonfinite         = nf + r;
+        };
+        init_cfg(configs_o[r], counts_dev, nf_oracle);
+        init_cfg(configs_c[r], counts_dev, nf_compact);
+    }
+
+    const std::vector<int> extents{k, k, k, 5, k, k, k, 4};
+    const std::vector<int> lengths{40, 41, 42, 43, 44, 45, 46, 47};
+    const std::vector<int> anchors{5, 6, 7, 8, 9, 10, 11, 12};
+
+    auto setup_buf = [&](AcceptBuffers& b, const std::vector<ops::SamplingConfig>& cfgs) {
+        write_logits(b.logits, bf16_logits);
+        write_buffer(b.targets, targets);
+        write_buffer(b.drafts, drafts);
+        write_buffer(b.candidates, candidates);
+        write_buffer(b.q, q);
+        write_buffer(b.extents, extents);
+        write_buffer(b.lengths, lengths);
+        write_buffer(b.anchors, anchors);
+        write_buffer(b.configs, cfgs);
+        b.licensed.fill(0xff);
+        b.path.fill(0xff);
+        b.branch.fill(0xee);
+    };
+    setup_buf(oracle, configs_o);
+    setup_buf(compact, configs_c);
+    write_buffer(d_cids, compact_ids);
+    write_buffer(d_clogits, compact_logits);
+    write_buffer(d_ccounts, compact_counts);
+
+    GuardedDeviceBuffer ws(
+        ops::speculative_accept_sparse_tree_workspace_capacity_bytes(kTokenDomain, n, batch, batch));
+    run_tree_accept(oracle, tree_rows, ws, nullptr);
+    {
+        Tensor cl = compact.t_lengths(), ca = compact.t_anchors(), clic = compact.t_licensed(),
+               ccnt = compact.t_counts(), cacc = compact.t_accepted(), cpath = compact.t_path(),
+               cbr = compact.t_branch();
+        ops::speculative_accept_compact_sparse_tree(
+            Tensor(d_cids.data(), DType::I32, {cap, n, batch}),
+            Tensor(d_clogits.data(), DType::FP32, {cap, n, batch}),
+            Tensor(d_ccounts.data(), DType::I32, {n, batch}), compact.t_drafts(),
+            compact.t_candidates(), compact.t_q(), compact.t_extents(), rows_tensor(tree_rows, batch),
+            cl, ca, clic, ccnt, cacc, cpath, cbr, kTokenDomain, compact.t_configs(), nullptr,
+            {.update_token_counts = true});
+    }
+    cuda_synchronize();
+
+    const auto out_o = read_outputs(oracle);
+    const auto out_c = read_outputs(compact);
+    int failures     = 0;
+    failures += verify_exact("compact tree licensed vs oracle", out_c.licensed, out_o.licensed);
+    failures += verify_exact("compact tree counts vs oracle", out_c.counts, out_o.counts);
+    failures += verify_exact("compact tree accepted vs oracle", out_c.accepted, out_o.accepted);
+    failures += verify_exact("compact tree lengths vs oracle", out_c.lengths, out_o.lengths);
+    failures += verify_exact("compact tree anchors vs oracle", out_c.anchors, out_o.anchors);
+    failures += verify_exact("compact tree path vs oracle", out_c.path, out_o.path);
+    failures += verify_exact("compact tree branch vs oracle", out_c.branch, out_o.branch);
+    failures += expect(out_c.branch[5] >= 1, "compact tree raw greedy row 5 took side branch");
+    failures += expect(out_c.branch[7] == -1, "compact tree raw greedy row 7 chain branch");
+
+    auto expected_tc = init_counts;
+    for (int r = 0; r < batch; ++r) {
+        for (int i = 0; i < out_c.counts[r]; ++i) {
+            ++expected_tc[out_c.licensed[r * n + i]];
+        }
+    }
+    failures += verify_exact("compact tree token_counts update",
+                             read_buffer<std::int32_t>(d_counts_compact, kTokenDomain), expected_tc);
+    failures += verify_exact("compact tree nonfinite finite",
+                             read_buffer<std::int32_t>(d_nonfinite_compact, batch),
+                             read_buffer<std::int32_t>(d_nonfinite_oracle, batch));
+
+    // Nonfinite edge case: zero compact candidates (all -Inf dense logits) under raw greedy & sampled.
+    bf16_logits.assign(bf16_logits.size(), kNegInfBf16);
+    compact_counts.assign(compact_counts.size(), 0);
+    targets.assign(targets.size(), 0);
+    d_nonfinite_oracle.fill(0);
+    d_nonfinite_compact.fill(0);
+    for (int r = 0; r < batch; ++r) {
+        configs_o[r].temperature = (r % 2 == 0) ? 0.0F : 1.0F;
+        configs_o[r].presence_penalty = 0.0F;
+        configs_o[r].frequency_penalty = 0.0F;
+        configs_o[r].forbidden_token = -1;
+        configs_o[r].gumbel_max = false;
+        configs_c[r] = configs_o[r];
+        configs_o[r].nonfinite = nf_oracle + r;
+        configs_c[r].nonfinite = nf_compact + r;
+    }
+    setup_buf(oracle, configs_o);
+    setup_buf(compact, configs_c);
+    write_buffer(d_ccounts, compact_counts);
+    run_tree_accept(oracle, tree_rows, ws, nullptr);
+    {
+        Tensor cl = compact.t_lengths(), ca = compact.t_anchors(), clic = compact.t_licensed(),
+               ccnt = compact.t_counts(), cacc = compact.t_accepted(), cpath = compact.t_path(),
+               cbr = compact.t_branch();
+        ops::speculative_accept_compact_sparse_tree(
+            Tensor(d_cids.data(), DType::I32, {cap, n, batch}),
+            Tensor(d_clogits.data(), DType::FP32, {cap, n, batch}),
+            Tensor(d_ccounts.data(), DType::I32, {n, batch}), compact.t_drafts(),
+            compact.t_candidates(), compact.t_q(), compact.t_extents(), rows_tensor(tree_rows, batch),
+            cl, ca, clic, ccnt, cacc, cpath, cbr, kTokenDomain, compact.t_configs(), nullptr,
+            {.update_token_counts = false});
+    }
+    cuda_synchronize();
+    const auto nf_o_out = read_buffer<std::int32_t>(d_nonfinite_oracle, batch);
+    const auto nf_c_out = read_buffer<std::int32_t>(d_nonfinite_compact, batch);
+    failures += verify_exact("compact tree nonfinite all-inf flags", nf_c_out, nf_o_out);
+    failures += expect(std::all_of(nf_c_out.begin(), nf_c_out.end(), [](int v) { return v == 1; }),
+                       "compact tree nonfinite expected 1");
+    failures += verify_exact("compact tree nonfinite licensed",
+                             read_outputs(compact).licensed, read_outputs(oracle).licensed);
+    failures += compact.licensed.verify_guards("compact tree licensed") +
+                ws.verify_guards("compact tree ws");
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(speculative_tree) {
@@ -2270,6 +2537,7 @@ INFERNIX_OP_TEST(speculative_tree) {
             failures += greedy_tree_case();
             failures += chain_equivalence_case();
             for (int m = 1; m <= 4; ++m) failures += distribution_case(m);
+            failures += compact_tree_case();
         } catch (const std::exception& error) {
             std::cerr << "speculative tree FP32 test threw: " << error.what() << '\n';
             return 1;
@@ -2294,6 +2562,7 @@ INFERNIX_OP_TEST(speculative_tree) {
         failures += greedy_tree_case();
         failures += chain_equivalence_case();
         for (int m = 1; m <= 4; ++m) failures += distribution_case(m);
+        failures += compact_tree_case();
         failures += selector_case(16, 4);
         failures += selector_case(32, 8);
         failures += selector_case(24, 2);

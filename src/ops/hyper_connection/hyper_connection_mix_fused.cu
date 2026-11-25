@@ -198,9 +198,9 @@ struct Bf16Codec {
 // every value read is hc_injected(R, pending_inject[t][s], pending_y[t][d]).
 template <class Codec, class Norm, bool Pending, int PassColumns = 1, int MinBlocks = 2>
 __global__ __launch_bounds__(kDownThreads, MinBlocks) void hc_down_partials_kernel(
-    const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
+    const bf16* residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
     int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out,
-    const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
+    const bf16* pending_y, const float* pending_inject) {
     extern __shared__ __align__(16) float rn[]; // [PassColumns][kHidden]
     __shared__ float scratch[kDownThreads / 32][PassColumns];
     __shared__ float inv[PassColumns];
@@ -438,10 +438,10 @@ __global__ __launch_bounds__(kDownThreads, MinBlocks) void hc_down_partials_kern
 // the inject applied, as hyper_connection_inject would have left it. The residual is written only then.
 template <class Codec, class Norm, bool Pending, int Columns = 0, int MinBlocks = 1>
 __global__ __launch_bounds__(kUpThreads, MinBlocks) void hc_up_collapse_kernel(
-    const float* __restrict__ partial, const float* __restrict__ inv_in, bf16* __restrict__ residual,
+    const float* partial, const float* inv_in, bf16* __restrict__ residual,
     const Norm* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
-    float* __restrict__ inject, bf16* __restrict__ x, const bf16* __restrict__ pending_y,
-    const float* __restrict__ pending_inject) {
+    float* __restrict__ inject, bf16* __restrict__ x, const bf16* pending_y,
+    const float* pending_inject) {
     // Dynamic shared memory: sized to actual rank x columns at launch time rather than the
     // worst-case compile-time bounds. For decode (rank=320, columns=1) this drops from 128 KB
     // to ~5 KB, raising CTAs-per-SM from 1 to ~18 and exposing enough warps to hide DRAM latency.
@@ -755,9 +755,9 @@ __device__ __forceinline__ float warp_sum8_transposed(const float (&v)[8], int l
 // (T = 2..3) and neutral at 4..8, so the pass loop stays.
 template <class Codec, class Norm, bool Pending, int ExactColumns = 0>
 __global__ __launch_bounds__(kDownThreads, (ExactColumns >= 2 && ExactColumns <= 4) ? 2 : 1) void hc_down_partials_v4_kernel(
-    const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
+    const bf16* residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
     int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out,
-    const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
+    const bf16* pending_y, const float* pending_inject) {
     constexpr int RowsPerWarp = 2;
     constexpr int kColumns    = ExactColumns > 0 ? ExactColumns : kPassColumns; // columns per pass
     extern __shared__ __align__(16) float rn[]; // [kColumns][2][kHidden / 2]
@@ -961,10 +961,10 @@ template <class Codec, class Norm, bool Pending, int ExactColumns = 0>
 __global__ __launch_bounds__(
     kUpV4Threads,
     (std::is_same_v<Codec, Q8Codec> || std::is_same_v<Codec, Q4Codec>) && (ExactColumns >= 2 && ExactColumns <= 4) ? 2 : 1) void hc_up_collapse_v4_kernel(
-    const float* __restrict__ partial, const float* __restrict__ inv_in, bf16* __restrict__ residual,
+    const float* partial, const float* inv_in, bf16* __restrict__ residual,
     const Norm* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
-    float* __restrict__ inject, bf16* __restrict__ x, const bf16* __restrict__ pending_y,
-    const float* __restrict__ pending_inject) {
+    float* __restrict__ inject, bf16* __restrict__ x, const bf16* pending_y,
+    const float* pending_inject) {
     static_assert(kUpFeatures == 2 * kUpV4Warps && kUpV4Rows == 2 * kStreams);
     static_assert(kUpFeatures * kSimtMaxColumns <= kUpV4Threads);
     const int n_cols = ExactColumns > 0 ? ExactColumns : columns;
@@ -1280,9 +1280,9 @@ struct DownMmaShared {
 // across the 4 streams in DSMEM on cluster rank 0, and writes BF16 m = SiLU(z / 4) and FP32 inject.
 template <class Norm, bool Pending, int TCap>
 __global__ __launch_bounds__(kDownMmaThreads, TCap == 8 ? 2 : 1) void hc_down_partials_q4_mma_kernel(
-    const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, Q4Codec::Params down, int rows, int rank,
+    const bf16* residual, const Norm* __restrict__ norm_weight, Q4Codec::Params down, int rows, int rank,
     int columns, float eps, bf16* __restrict__ m_out, float* __restrict__ inject, float* __restrict__ inv_out,
-    const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
+    const bf16* pending_y, const float* pending_inject) {
     static_assert(TCap == 8 || TCap == 16);
     static_assert(kDownMmaGroups * 64 == kHidden && kDownMmaTiles * 4 == kDownMmaGroups);
     constexpr int kNT        = TCap / 8;
@@ -1536,9 +1536,9 @@ __global__ __launch_bounds__(kDownMmaThreads, TCap == 8 ? 2 : 1) void hc_down_pa
 // W_up Q4 weights once into SMEM, computes u = W_up m_bf16 via mma_bf16, and collapses residual.
 template <class Norm, bool Pending, int TCap>
 __global__ __launch_bounds__(kUpMmaThreads, 4) void hc_up_collapse_q4_mma_kernel(
-    const bf16* __restrict__ m_in, const float* __restrict__ inv_in, bf16* __restrict__ residual,
+    const bf16* m_in, const float* inv_in, bf16* __restrict__ residual,
     const Norm* __restrict__ norm_weight, Q4Codec::Params up, int rank, int columns, bf16* __restrict__ x,
-    const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
+    const bf16* pending_y, const float* pending_inject) {
     static_assert(TCap == 8 || TCap == 16);
     static_assert(kUpMmaMaxGroups == kMaxRank / 64);
     constexpr int kNT   = TCap / 8;
@@ -1760,32 +1760,18 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
     const int columns = residual.ne[1];
     if constexpr (std::is_same_v<Codec, Q4Codec>) {
         if (columns >= 5) {
-            const auto* norm_ptr     = static_cast<const Norm*>(norm_weight.data);
-            const auto* res_base     = static_cast<const bf16*>(residual.data);
-            auto* x_base             = static_cast<bf16*>(x.data);
-            float* inject_base       = inject != nullptr ? static_cast<float*>(inject->data) : nullptr;
-            std::byte* scratch_cursor = static_cast<std::byte*>(partials);
-            for (int col0 = 0; col0 < columns; col0 += 16) {
-                const int slice_cols = std::min(16, columns - col0);
-                const auto* res_ptr  = res_base + static_cast<std::int64_t>(col0) * streams * kHidden;
-                auto* x_ptr          = x_base + static_cast<std::int64_t>(col0) * kHidden;
-                float* inject_ptr    = inject_base != nullptr ? inject_base + static_cast<std::int64_t>(col0) * streams : nullptr;
-                const bf16* py_ptr   = pending.y != nullptr ? pending.y + static_cast<std::int64_t>(col0) * kHidden : nullptr;
-                const float* pi_ptr =
-                    pending.inject != nullptr ? pending.inject + static_cast<std::int64_t>(col0) * streams : nullptr;
-                if (slice_cols <= 8) {
-                    launch_q4_mma_slice<Norm, Fold, 8>(res_ptr, norm_ptr, down, up, down_rows, rank, streams, eps,
-                                                       slice_cols, x_ptr, inject_ptr, scratch_cursor, py_ptr, pi_ptr,
-                                                       stream);
-                } else {
-                    launch_q4_mma_slice<Norm, Fold, 16>(res_ptr, norm_ptr, down, up, down_rows, rank, streams, eps,
-                                                        slice_cols, x_ptr, inject_ptr, scratch_cursor, py_ptr, pi_ptr,
-                                                        stream);
-                }
-                const std::size_t slice_bytes =
-                    (static_cast<std::size_t>(rank) * slice_cols * sizeof(bf16) + 255) / 256 * 256 +
-                    (static_cast<std::size_t>(streams) * slice_cols * sizeof(float) + 255) / 256 * 256;
-                scratch_cursor += slice_bytes;
+            const auto* norm_ptr = static_cast<const Norm*>(norm_weight.data);
+            const auto* res_ptr  = static_cast<const bf16*>(residual.data);
+            auto* x_ptr          = static_cast<bf16*>(x.data);
+            float* inject_ptr    = inject != nullptr ? static_cast<float*>(inject->data) : nullptr;
+            if (columns <= 8) {
+                launch_q4_mma_slice<Norm, Fold, 8>(res_ptr, norm_ptr, down, up, down_rows, rank, streams, eps,
+                                                   columns, x_ptr, inject_ptr, partials, pending.y, pending.inject,
+                                                   stream);
+            } else {
+                launch_q4_mma_slice<Norm, Fold, 16>(res_ptr, norm_ptr, down, up, down_rows, rank, streams, eps,
+                                                    columns, x_ptr, inject_ptr, partials, pending.y, pending.inject,
+                                                    stream);
             }
             return;
         }

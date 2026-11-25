@@ -88,6 +88,10 @@ template <class... KernelArgs, class... CallArgs>
 __device__ __forceinline__ void trigger_dependents() { cudaTriggerProgrammaticLaunchCompletion(); }
 
 // Call on every consumer control path before its first access to producer-dependent data.
+// Producer-written input pointers must NOT be qualified `const __restrict__`: in PTX, that lowers
+// loads to `ld.global.nc` (read-only for the whole kernel), which ptxas 13.2+ can hoist above
+// `griddepcontrol.wait` (ACQBULK) into weight-staging prologues. Keep `const __restrict__` for
+// immutable weights only.
 __device__ __forceinline__ void wait_for_dependencies() { cudaGridDependencySynchronize(); }
 
 // Consumer protocol for launch_consumer(). Call one of these in every thread, before any access

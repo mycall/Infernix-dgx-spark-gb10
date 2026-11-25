@@ -65,6 +65,15 @@ void speculative_accept_sparse_tree_launch(
     Tensor& accepted_branch, std::int32_t token_domain, const SamplingConfig* configs,
     bool raw_greedy, DeviceSpan workspace, cudaStream_t stream);
 
+void speculative_accept_compact_sparse_tree_launch(
+    const Tensor& compact_ids, const Tensor& compact_logits, const Tensor& compact_counts,
+    const Tensor& drafts, const Tensor& candidate_ids, const Tensor& proposal_q,
+    const Tensor& current_extents, const Tensor& tree_rows, Tensor& round_lengths,
+    Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted_drafts, Tensor& accepted_path, Tensor& accepted_branch,
+    std::int32_t token_domain, const SamplingConfig* configs, bool update_token_counts,
+    cudaStream_t stream);
+
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,
                                                Tensor& out, cudaStream_t stream);
 

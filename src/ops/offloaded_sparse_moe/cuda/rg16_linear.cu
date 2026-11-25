@@ -165,7 +165,7 @@ __device__ __forceinline__ Act encode_block(const unsigned (&words)[8], int e) {
 // exponent): the column exponent, then every block's encoding into acts[column][block].
 template <class D>
 __global__ void __launch_bounds__(round_up32(D::kBlocks))
-    encode_kernel(const std::uint16_t* __restrict__ x, Act* __restrict__ acts, std::int32_t* __restrict__ emax) {
+    encode_kernel(const std::uint16_t* x, Act* __restrict__ acts, std::int32_t* __restrict__ emax) {
     constexpr int kEncodeThreads = round_up32(D::kBlocks);
     __shared__ unsigned keys[kEncodeThreads / 32];
     const int t = static_cast<int>(blockIdx.x), b = static_cast<int>(threadIdx.x);
@@ -229,7 +229,7 @@ __device__ __forceinline__ void store_rows(const long long (&s)[Columns], const 
 // column and one 16-element block per thread. The blocks of the last stage past K are zero.
 template <class D>
 __global__ void __launch_bounds__(round_up32(D::kPadBlocks))
-    limbs_kernel(const std::uint16_t* __restrict__ x, std::uint8_t* __restrict__ limbs, std::int32_t* __restrict__ emax) {
+    limbs_kernel(const std::uint16_t* x, std::uint8_t* __restrict__ limbs, std::int32_t* __restrict__ emax) {
     constexpr int kEncodeThreads = round_up32(D::kPadBlocks);
     __shared__ unsigned keys[kEncodeThreads / 32];
     const int t = static_cast<int>(blockIdx.x), b = static_cast<int>(threadIdx.x);
@@ -253,8 +253,8 @@ __global__ void __launch_bounds__(round_up32(D::kPadBlocks))
 // warp's row group at k = 8 half .. 8 half + 7 of each block; the halves' products are joined
 // before the scale, as the narrow expert route does.
 template <class D, int Columns, bool F32>
-__global__ void __launch_bounds__(kThreads) narrow_kernel(const Act* __restrict__ acts,
-                                                          const std::int32_t* __restrict__ emax,
+__global__ void __launch_bounds__(kThreads) narrow_kernel(const Act* acts,
+                                                          const std::int32_t* emax,
                                                           const std::uint8_t* __restrict__ matrix, float multiplier,
                                                           int n, void* __restrict__ out) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -308,7 +308,7 @@ constexpr bool kStreamed = D::kBlocks % 24 == 0 && kStreamBytes<D, Columns> <= k
 
 template <class D, int Columns, bool F32>
 __global__ void __launch_bounds__(kStreamThreads, 1)
-    stream_kernel(const std::uint16_t* __restrict__ x, const std::uint8_t* __restrict__ matrix, float multiplier, int n,
+    stream_kernel(const std::uint16_t* x, const std::uint8_t* __restrict__ matrix, float multiplier, int n,
                   void* __restrict__ out) {
     constexpr int kDepth = kStreamDepth<Columns>;
     static_assert(D::kBlocks % kDepth == 0);

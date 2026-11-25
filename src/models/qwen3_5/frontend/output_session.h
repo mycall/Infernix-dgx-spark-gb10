@@ -94,6 +94,7 @@ public:
     void discard_preview();
     [[nodiscard]] bool constrained() const noexcept;
     [[nodiscard]] runtime::ForbiddenToken forbidden_token() const noexcept;
+    [[nodiscard]] TokenId branch_tool_token() const noexcept;
     void observe_constraint(bool timings, double prepare_seconds) noexcept;
     void constraint_uploaded(std::size_t bytes) noexcept;
     [[nodiscard]] std::optional<ConstraintObservation> constraint_observation() const;

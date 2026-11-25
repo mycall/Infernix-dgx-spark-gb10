@@ -24,13 +24,15 @@ struct NgramSourceView {
 
 struct NgramMatch {
     std::vector<TokenId> tokens;
-    std::uint32_t matched     = 0;
-    std::uint64_t source      = 0;
-    std::uint32_t offset      = 0;
-    NgramSourceKind kind      = NgramSourceKind::Text;
-    bool archived             = false;
-    std::uint32_t occurrences = 0;
-    std::uint32_t distance    = 0;
+    std::uint32_t matched         = 0;
+    std::uint64_t source          = 0;
+    std::uint32_t offset          = 0;
+    NgramSourceKind kind          = NgramSourceKind::Text;
+    bool archived                 = false;
+    std::uint32_t occurrences     = 0;
+    std::uint32_t distance        = 0;
+    TokenId alt_token             = -1;
+    std::uint32_t alt_occurrences = 0;
 };
 
 struct NgramArchiveLimits {

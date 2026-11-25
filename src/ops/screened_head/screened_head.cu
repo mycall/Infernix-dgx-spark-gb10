@@ -98,9 +98,20 @@ constexpr int screen_shared_bytes() {
 static_assert(screen_shared_bytes<1, true>() * 2 <= 102400, "two narrow-ring screen CTAs fit one SM's budget");
 static_assert(screen_shared_bytes<1, false>() <= 101376, "the deep-ring screen CTA fits one SM's opt-in");
 static_assert(screen_shared_bytes<2, false>() <= 101376, "the screen kernel's ring and columns fit one CTA");
+static_assert(screen_shared_bytes<3, true>() <= 101376, "the 24-column narrow-ring screen CTA fits one SM's opt-in");
+
+constexpr int kGmemScreenTiles = 4;
+constexpr int kGmemScreenRing  = 4;
+constexpr int kGmemScreenCols  = screen_columns<kGmemScreenTiles>();
+constexpr int screen_gmem_shared_bytes() {
+    return kGmemScreenRing * kStageBytes + kScreenWarps * kItemRows * kGmemScreenCols * 4;
+}
+static_assert(screen_gmem_shared_bytes() <= 101376, "the 32-column gmem-x deep-ring screen CTA fits one SM's opt-in");
 
 struct ScreenParams {
     const bf16* x;              // [K, T]
+    std::uint8_t* xq;           // [T, kColumnPitch] pre-quantized DP4A copy (columns > 16)
+    float2* xs;                 // [T, kGroups] per-group (scale, 2 * code sum)
     const std::uint8_t* codes;  // [R, 640]
     const std::uint8_t* scales; // [R, 40] binary16
     std::int32_t rows;          // R, a multiple of 16
@@ -158,6 +169,42 @@ __device__ void quantize_columns(const ScreenParams& p, std::uint8_t* xq, float2
         for (int offset = 4; offset > 0; offset >>= 1) { sum += __shfl_xor_sync(0xffffffffu, sum, offset); }
         if (octet == 0) { xs[column * kGroups + group] = make_float2(amax / 127.0f, static_cast<float>(2 * sum)); }
     }
+}
+
+__global__ void __launch_bounds__(kScreenThreads) quantize_columns_gmem_kernel(ScreenParams p) {
+    const int column = static_cast<int>(blockIdx.x);
+    if (column >= p.columns) { return; }
+    pdl::enter();
+    const bf16* xcol         = p.x + static_cast<std::size_t>(column) * kHidden;
+    std::uint8_t* xq_col     = p.xq + static_cast<std::size_t>(column) * kColumnPitch;
+    float2* xs_col           = p.xs + static_cast<std::size_t>(column) * kGroups;
+    for (int item = static_cast<int>(threadIdx.x); item < kGroups * 8; item += kScreenThreads) {
+        const int group = item / 8, octet = item % 8;
+        const uint4 raw = __ldcg(reinterpret_cast<const uint4*>(xcol + group * 64 + octet * 8));
+        const bf16* values = reinterpret_cast<const bf16*>(&raw);
+        float v[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { v[j] = __bfloat162float(values[j]); }
+        float amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { amax = fmaxf(amax, fabsf(v[j])); }
+#pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) { amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset)); }
+        const float inverse = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int sum             = 0;
+        std::uint8_t* chunk = xq_col + group * 64 + (octet / 2) * 16;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int q        = max(-127, min(127, __float2int_rn(v[j] * inverse)));
+            sum               += q;
+            const int position = (octet & 1) * 8 + j;
+            chunk[4 * (position % 4) + position / 4] = static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+        }
+#pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) { sum += __shfl_xor_sync(0xffffffffu, sum, offset); }
+        if (octet == 0) { xs_col[group] = make_float2(amax / 127.0f, static_cast<float>(2 * sum)); }
+    }
+    pdl::trigger_dependents();
 }
 
 // Persistent CTAs over 16-row items i = blockIdx.x + k * gridDim.x. A column's screen
@@ -283,6 +330,218 @@ __global__ void __launch_bounds__(kScreenThreads, 1) screen_kernel(ScreenParams 
             const int e   = r * C + col;
             // The K split's fixed summation order: warp 0's slot first, ascending.
             float v = partial[e];
+#pragma unroll
+            for (int w = 1; w < kWarps; ++w) { v += partial[w * kItemRows * C + e]; }
+            if constexpr (Logits) {
+                if (col < p.columns) {
+                    p.logits[static_cast<std::size_t>(col) * p.rows + row] = v;
+                }
+            }
+            const bool active = col < p.columns && row < p.valid_rows;
+            const float score = active ? v : negative_infinity();
+            float item_max    = score;
+#pragma unroll
+            for (int offset = 8; offset > 0; offset >>= 1) {
+                item_max = fmaxf(item_max, __shfl_xor_sync(0xffffffffu, item_max, offset));
+            }
+            const unsigned cand_ballot = __ballot_sync(
+                0xffffffffu,
+                active && ranks_above(score, row, best[nt][kListLength - 1], best_row[nt][kListLength - 1]));
+            unsigned cand_mask = (cand_ballot >> half_shift) & 0xffffu;
+            while (cand_mask != 0u) {
+                const int src      = __ffs(cand_mask) - 1;
+                cand_mask         &= cand_mask - 1u;
+                const int src_lane = half_shift + src;
+                const float cv     = __shfl_sync(hmask, score, src_lane);
+                const int crow     = row0 + src;
+                if (ranks_above(cv, crow, best[nt][kListLength - 1], best_row[nt][kListLength - 1])) {
+                    bool placed = false;
+#pragma unroll
+                    for (int i = kListLength - 1; i > 0; --i) {
+                        if (!placed) {
+                            if (ranks_above(cv, crow, best[nt][i - 1], best_row[nt][i - 1])) {
+                                best[nt][i]     = best[nt][i - 1];
+                                best_row[nt][i] = best_row[nt][i - 1];
+                            } else {
+                                best[nt][i]     = cv;
+                                best_row[nt][i] = crow;
+                                placed          = true;
+                            }
+                        }
+                    }
+                    if (!placed) {
+                        best[nt][0]     = cv;
+                        best_row[nt][0] = crow;
+                    }
+                }
+            }
+            if constexpr (Softmax) {
+                const float top = fmaxf(column_max[nt], item_max);
+                float term      = (item_max > negative_infinity() && active) ? __expf(score - top) : 0.0f;
+#pragma unroll
+                for (int offset = 8; offset > 0; offset >>= 1) {
+                    term += __shfl_xor_sync(0xffffffffu, term, offset);
+                }
+                if (col < p.columns && item_max > negative_infinity()) {
+                    column_sum[nt] = column_sum[nt] * __expf(column_max[nt] - top) + term;
+                    column_max[nt] = top;
+                }
+            }
+        }
+    }
+    pdl::trigger_dependents();
+    __syncthreads();
+    auto* out_lists = reinterpret_cast<float2*>(partial);
+#pragma unroll
+    for (int nt = 0; nt < Tiles; ++nt) {
+        const int col = nt * 8 + sub;
+        if (r == 0 && col < p.columns) {
+#pragma unroll
+            for (int j = 0; j < kListLength; ++j) {
+                out_lists[sub * kListLength + j] = make_float2(best[nt][j], __int_as_float(best_row[nt][j]));
+            }
+        }
+        __syncwarp();
+        if (col < p.columns) {
+            if (r < kListLength) {
+                float2* list = p.lists + (static_cast<std::size_t>(col) * gridDim.x + blockIdx.x) * kListLength;
+                list[r]      = out_lists[sub * kListLength + r];
+            }
+            if constexpr (Softmax) {
+                if (r == 0) {
+                    p.partials[static_cast<std::size_t>(col) * gridDim.x + blockIdx.x] =
+                        make_float2(column_max[nt], column_sum[nt]);
+                }
+            }
+        }
+        __syncwarp();
+    }
+}
+
+// 4-stage deep-ring 32-column screen kernel for T = 17..32 (and 32-col chunks of T > 32): holds
+// only the 4-stage 2-bit weight+scale ring and warp partials in SMEM while streaming pre-quantized
+// int8 activations from L2 (pinned by hardware access-policy window).
+template <bool Logits, bool Softmax>
+__global__ void __launch_bounds__(kScreenThreads, 1) screen_kernel_gmem_x(ScreenParams p) {
+    extern __shared__ __align__(16) std::uint8_t shared[];
+    constexpr int Tiles          = kGmemScreenTiles;
+    constexpr int C              = kGmemScreenCols;
+    constexpr int kRing          = kGmemScreenRing;
+    constexpr int kWarps         = kScreenWarps;
+    constexpr int kThreads       = kScreenThreads;
+    constexpr int kGroupsPerWarp = kGroups / kWarps;
+    std::uint8_t* stages         = shared;
+    float* partial               = reinterpret_cast<float*>(stages + kRing * kStageBytes);
+    const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int sub        = tid >> 4;
+    const int r          = tid & 15;
+    const int half_shift = (sub & 1) * 16;
+    const unsigned hmask = 0xffffu << half_shift;
+    const int items      = p.rows / kItemRows;
+    const int first      = static_cast<int>(blockIdx.x), stride = static_cast<int>(gridDim.x);
+    const int mine       = first < items ? (items - first + stride - 1) / stride : 0;
+
+    const auto issue = [&](int k) {
+        const std::size_t item         = static_cast<std::size_t>(first) + static_cast<std::size_t>(k) * stride;
+        std::uint8_t* stage            = stages + (k % kRing) * kStageBytes;
+        const std::uint8_t* code_src   = p.codes + item * (kItemRows * kCodeRowBytes);
+        const std::uint8_t* scale_src  = p.scales + item * (kItemRows * kScaleRowBytes);
+        for (int c = tid; c < kItemRows * kCodeRowBytes / 16; c += kThreads) {
+            const int row = c / (kCodeRowBytes / 16), part = c % (kCodeRowBytes / 16);
+            cp_async<16, Cache::cg>(stage + row * kCodePitch + part * 16, code_src + c * 16);
+        }
+        for (int c = tid; c < kItemRows * kScaleRowBytes / 16; c += kThreads) {
+            cp_async<16, Cache::cg>(stage + kStageCodeBytes + c * 16, scale_src + c * 16);
+        }
+    };
+
+#pragma unroll
+    for (int k = 0; k < kRing - 1; ++k) {
+        if (k < mine) { issue(k); }
+        cp_commit();
+    }
+    pdl::enter_streaming();
+
+    float best[Tiles][kListLength];
+    int best_row[Tiles][kListLength];
+    float column_max[Tiles];
+    float column_sum[Tiles];
+#pragma unroll
+    for (int nt = 0; nt < Tiles; ++nt) {
+#pragma unroll
+        for (int j = 0; j < kListLength; ++j) {
+            best[nt][j]     = negative_infinity();
+            best_row[nt][j] = INT_MAX;
+        }
+        column_max[nt] = negative_infinity();
+        column_sum[nt] = 0.0f;
+    }
+
+    for (int k = 0; k < mine; ++k) {
+        cp_wait<kRing - 2>();
+        __syncthreads();
+        if (k + kRing - 1 < mine) { issue(k + kRing - 1); }
+        cp_commit();
+        const std::uint8_t* stage = stages + (k % kRing) * kStageBytes;
+        const auto* scales        = reinterpret_cast<const __half*>(stage + kStageCodeBytes);
+        float acc[Tiles][4];
+#pragma unroll
+        for (int nt = 0; nt < Tiles; ++nt) { acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f; }
+#pragma unroll 2
+        for (int j = 0; j < kGroupsPerWarp; ++j) {
+            const int group = warp * kGroupsPerWarp + j;
+            const std::uint32_t w0 =
+                *reinterpret_cast<const std::uint32_t*>(stage + g * kCodePitch + group * 16 + t * 4) ^ 0xAAAAAAAAu;
+            const std::uint32_t w1 =
+                *reinterpret_cast<const std::uint32_t*>(stage + (g + 8) * kCodePitch + group * 16 + t * 4) ^
+                0xAAAAAAAAu;
+            const float s0 = __half2float(scales[g * kGroups + group]);
+            const float s1 = __half2float(scales[(g + 8) * kGroups + group]);
+            constexpr std::uint32_t kLevels = 0x03030303u;
+#pragma unroll
+            for (int nt = 0; nt < Tiles; ++nt) {
+                const int xcol = nt * 8 + g;
+                const uint4 b =
+                    xcol < p.columns
+                        ? __ldg(reinterpret_cast<const uint4*>(p.xq + static_cast<std::size_t>(xcol) * kColumnPitch +
+                                                               group * 64 + t * 16))
+                        : make_uint4(0, 0, 0, 0);
+                int c0, c1, c2, c3;
+                mma_s8s8_k32_zero(c0, c1, c2, c3, w0 & kLevels, w1 & kLevels, (w0 >> 2) & kLevels, (w1 >> 2) & kLevels,
+                                  b.x, b.y);
+                mma_s8(c0, c1, c2, c3, (w0 >> 4) & kLevels, (w1 >> 4) & kLevels, (w0 >> 6) & kLevels,
+                       (w1 >> 6) & kLevels, b.z, b.w);
+                const int col0 = nt * 8 + 2 * t;
+                const int col1 = col0 + 1;
+                const float2 x0 =
+                    col0 < p.columns ? __ldg(p.xs + static_cast<std::size_t>(col0) * kGroups + group)
+                                     : make_float2(0.0f, 0.0f);
+                const float2 x1 =
+                    col1 < p.columns ? __ldg(p.xs + static_cast<std::size_t>(col1) * kGroups + group)
+                                     : make_float2(0.0f, 0.0f);
+                acc[nt][0] = fmaf(s0 * x0.x, static_cast<float>(c0) - x0.y, acc[nt][0]);
+                acc[nt][1] = fmaf(s0 * x1.x, static_cast<float>(c1) - x1.y, acc[nt][1]);
+                acc[nt][2] = fmaf(s1 * x0.x, static_cast<float>(c2) - x0.y, acc[nt][2]);
+                acc[nt][3] = fmaf(s1 * x1.x, static_cast<float>(c3) - x1.y, acc[nt][3]);
+            }
+        }
+        float* own = partial + warp * kItemRows * C;
+#pragma unroll
+        for (int nt = 0; nt < Tiles; ++nt) {
+            own[g * C + nt * 8 + 2 * t]           = acc[nt][0];
+            own[g * C + nt * 8 + 2 * t + 1]       = acc[nt][1];
+            own[(g + 8) * C + nt * 8 + 2 * t]     = acc[nt][2];
+            own[(g + 8) * C + nt * 8 + 2 * t + 1] = acc[nt][3];
+        }
+        __syncthreads();
+        const int row0 = (first + k * stride) * kItemRows;
+        const int row  = row0 + r;
+#pragma unroll
+        for (int nt = 0; nt < Tiles; ++nt) {
+            const int col = nt * 8 + sub;
+            const int e   = r * C + col;
+            float v       = partial[e];
 #pragma unroll
             for (int w = 1; w < kWarps; ++w) { v += partial[w * kItemRows * C + e]; }
             if constexpr (Logits) {
@@ -1016,6 +1275,93 @@ void launch_screen(const ScreenParams& p, int grid, cudaStream_t stream) {
 }
 
 template <bool Logits, bool Softmax>
+void launch_screen_gmem_x(const ScreenParams& p, int grid, cudaStream_t stream) {
+    constexpr auto kernel = screen_kernel_gmem_x<Logits, Softmax>;
+    constexpr int bytes   = screen_gmem_shared_bytes();
+    static const cudaError_t configured =
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    CUDA_CHECK(configured);
+
+    cudaLaunchAttribute attrs[2]{};
+    int num_attrs = 0;
+    if (pdl::graph_dependent(stream)) {
+        attrs[num_attrs].id                                           = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[num_attrs].val.programmaticStreamSerializationAllowed   = 1;
+        ++num_attrs;
+    }
+
+    const ScreenL2PolicyProps l2 = screen_l2_policy_props();
+    if (l2.max_window_bytes > 0 && p.xq != nullptr && p.columns > 0) {
+        const auto addr     = [](const void* ptr) { return reinterpret_cast<std::uintptr_t>(ptr); };
+        const auto overlaps = [](std::uintptr_t a0, std::uintptr_t a1, std::uintptr_t b0, std::uintptr_t b1) {
+            return a0 < b1 && b0 < a1;
+        };
+        const std::uintptr_t codes_lo  = addr(p.codes);
+        const std::uintptr_t codes_hi  = codes_lo + static_cast<std::size_t>(p.rows) * kCodeRowBytes;
+        const std::uintptr_t scales_lo = addr(p.scales);
+        const std::uintptr_t scales_hi = scales_lo + static_cast<std::size_t>(p.rows) * kScaleRowBytes;
+        const std::size_t max_pin      = std::min<std::size_t>(l2.max_window_bytes, 8ULL << 20);
+
+        std::uintptr_t win_lo = addr(p.xq);
+        std::uintptr_t win_hi = win_lo + static_cast<std::size_t>(p.columns) * kColumnPitch;
+        bool has_win          = win_hi > win_lo && (win_hi - win_lo) <= max_pin &&
+                       !overlaps(win_lo, win_hi, codes_lo, codes_hi) &&
+                       !overlaps(win_lo, win_hi, scales_lo, scales_hi);
+        const auto try_merge = [&](const void* ptr, std::size_t span_bytes) {
+            if (!has_win || ptr == nullptr || span_bytes == 0) { return; }
+            const std::uintptr_t lo     = addr(ptr);
+            const std::uintptr_t hi     = lo + span_bytes;
+            const std::uintptr_t new_lo = std::min(win_lo, lo);
+            const std::uintptr_t new_hi = std::max(win_hi, hi);
+            if (new_hi > new_lo && (new_hi - new_lo) <= max_pin && !overlaps(new_lo, new_hi, codes_lo, codes_hi) &&
+                !overlaps(new_lo, new_hi, scales_lo, scales_hi)) {
+                win_lo = new_lo;
+                win_hi = new_hi;
+            }
+        };
+        try_merge(p.xs, static_cast<std::size_t>(p.columns) * kGroups * sizeof(float2));
+        try_merge(p.lists, static_cast<std::size_t>(p.columns) * grid * kListLength * sizeof(float2));
+        if constexpr (Softmax) {
+            if (p.partials != nullptr) {
+                try_merge(p.partials, static_cast<std::size_t>(p.columns) * grid * sizeof(float2));
+            }
+        }
+        if (has_win && (win_hi - win_lo) <= l2.max_window_bytes) {
+            attrs[num_attrs].id                              = cudaLaunchAttributeAccessPolicyWindow;
+            attrs[num_attrs].val.accessPolicyWindow.base_ptr = reinterpret_cast<void*>(win_lo);
+            attrs[num_attrs].val.accessPolicyWindow.num_bytes = static_cast<std::size_t>(win_hi - win_lo);
+            attrs[num_attrs].val.accessPolicyWindow.hitRatio = 1.0F;
+            attrs[num_attrs].val.accessPolicyWindow.hitProp  = cudaAccessPropertyNormal;
+            attrs[num_attrs].val.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+            ++num_attrs;
+        }
+    }
+
+    cudaLaunchConfig_t config{};
+    config.gridDim          = dim3(grid);
+    config.blockDim         = dim3(kScreenThreads);
+    config.dynamicSmemBytes = static_cast<std::size_t>(bytes);
+    config.stream           = stream;
+    config.attrs            = num_attrs > 0 ? attrs : nullptr;
+    config.numAttrs         = static_cast<unsigned int>(num_attrs);
+    CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, p));
+}
+
+int screen_grid_gmem_x(int items) {
+    thread_local int cached_grid = 0;
+    if (cached_grid == 0) {
+        int device = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        int sms = 0, per_sm = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, screen_kernel_gmem_x<false, true>,
+                                                                kScreenThreads, screen_gmem_shared_bytes()));
+        cached_grid = std::clamp(sms * std::max(per_sm, 1), 1, kMaxGrid);
+    }
+    return std::min(cached_grid, items);
+}
+
+template <bool Logits, bool Softmax>
 int run_screen(const ScreenParams& p, cudaStream_t stream) {
     const int items = p.rows / kItemRows;
     if (p.columns <= 8) {
@@ -1028,27 +1374,43 @@ int run_screen(const ScreenParams& p, cudaStream_t stream) {
         launch_screen<1, false, Logits, Softmax>(p, grid, stream);
         return grid;
     }
-    const int grid = screen_grid<2, false>(items);
-    for (int col = 0; col < p.columns; col += 16) {
+    if (p.columns <= 16) {
+        const int grid = screen_grid<2, false>(items);
+        launch_screen<2, false, Logits, Softmax>(p, grid, stream);
+        return grid;
+    }
+    if (p.columns <= 24) {
+        const int grid = screen_grid<3, true>(items);
+        launch_screen<3, true, Logits, Softmax>(p, grid, stream);
+        return grid;
+    }
+    CUDA_CHECK(pdl::launch_consumer({dim3(p.columns), dim3(kScreenThreads), 0, stream},
+                                    quantize_columns_gmem_kernel, p));
+    const int grid = screen_grid_gmem_x(items);
+    for (int col = 0; col < p.columns; col += 32) {
         ScreenParams chunk = p;
         chunk.x            = p.x + static_cast<std::size_t>(col) * kHidden;
-        chunk.columns      = std::min(16, p.columns - col);
+        chunk.xq           = p.xq + static_cast<std::size_t>(col) * kColumnPitch;
+        chunk.xs           = p.xs + static_cast<std::size_t>(col) * kGroups;
+        chunk.columns      = std::min(32, p.columns - col);
         chunk.logits       = p.logits != nullptr ? p.logits + static_cast<std::size_t>(col) * p.rows : nullptr;
         chunk.lists        = p.lists + static_cast<std::size_t>(col) * grid * kListLength;
         chunk.partials     = p.partials != nullptr ? p.partials + static_cast<std::size_t>(col) * grid : nullptr;
-        launch_screen<2, false, Logits, Softmax>(chunk, grid, stream);
+        launch_screen_gmem_x<Logits, Softmax>(chunk, grid, stream);
     }
     return grid;
 }
 
 // The workspace recipe, shared by the query and the calls.
 struct Scratch {
-    Tensor lists, partials, entries, counts;
+    Tensor xq, xs, lists, partials, entries, counts;
 };
 
 template <class Allocator>
 Scratch allocate_scratch(Allocator& allocator, std::int32_t columns, std::int32_t cap) {
     Scratch s;
+    s.xq       = allocator.alloc(DType::I32, {kColumnPitch / 4, columns}, 256);
+    s.xs       = allocator.alloc(DType::FP32, {2 * kGroups, columns}, 256);
     s.lists    = allocator.alloc(DType::FP32, {2 * kListLength, kMaxGrid, columns}, 256);
     s.partials = allocator.alloc(DType::FP32, {2, kMaxGrid, columns}, 256);
     s.entries  = allocator.alloc(DType::I32, {cap, columns}, 256);
@@ -1058,6 +1420,8 @@ Scratch allocate_scratch(Allocator& allocator, std::int32_t columns, std::int32_
 
 ScreenParams screen_params(const Tensor& x, const Weight& screen, std::int32_t valid_rows, const Scratch& scratch) {
     return {.x          = static_cast<const bf16*>(x.data),
+            .xq         = static_cast<std::uint8_t*>(scratch.xq.data),
+            .xs         = static_cast<float2*>(scratch.xs.data),
             .codes      = static_cast<const std::uint8_t*>(screen.qdata),
             .scales     = static_cast<const std::uint8_t*>(screen.scales),
             .rows       = screen.n,
@@ -1107,6 +1471,8 @@ int screened_head_screen_grid(std::int32_t head_rows, std::int32_t columns) {
         throw std::invalid_argument("screened_head screen grid: invalid rows or column count");
     }
     const int items = head_rows / kItemRows;
+    if (columns > 24) { return screen_grid_gmem_x(items); }
+    if (columns > 16) { return screen_grid<3, true>(items); }
     if (columns > 8) { return screen_grid<2, false>(items); }
     return narrow_ring_device() ? screen_grid<1, true>(items) : screen_grid<1, false>(items);
 }

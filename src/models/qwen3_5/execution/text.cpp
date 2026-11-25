@@ -32,6 +32,7 @@
 #include "infernix/ops/residual_add.h"
 #include "infernix/ops/rmsnorm.h"
 #include "infernix/ops/rope.h"
+#include "infernix/ops/sampling.h"
 #include "infernix/ops/sparse_moe.h"
 #include "infernix/ops/scatter.h"
 #include "infernix/ops/scalar.h"
@@ -1624,9 +1625,11 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     io_, logits, nullptr,
                     dimension(parameters_.model.resources().public_token_count), s);
                 if (sampling_config_ != nullptr) {
-                    ops::sample(logits, io_.token,
-                                dimension(parameters_.model.resources().public_token_count),
-                                sampling_config_, io_.pos, ops::kSamplePurposePrefill, work_, s);
+                    const std::int32_t domain =
+                        dimension(parameters_.model.resources().public_token_count);
+                    ops::filter_combined_branch_masks(logits, domain, sampling_config_, s);
+                    ops::sample(logits, io_.token, domain, sampling_config_, io_.pos,
+                                ops::kSamplePurposePrefill, work_, s);
                 } else {
                     ops::argmax(logits, io_.token,
                                 dimension(parameters_.model.resources().public_token_count), s);

@@ -2393,16 +2393,25 @@ int test_tools_and_json_output() {
     infernix::ToolChoice choice;
     choice.constraints = infernix::ToolConstraintMode::Automatic;
     int failures       = 0;
+    auto required_choice = choice;
+    required_choice.mode = infernix::ToolChoiceMode::Required;
+    auto required_session =
+        frontend.make_output_session(prompt, {}, {}, {}, body, required_choice);
+    failures += check(required_session.branch_tool_token() < 0,
+                      "required tool choice activated combined branch gate");
     for (const auto& text : {json, call}) {
         auto session = frontend.make_output_session(prompt, {}, {}, {}, body, choice);
+        failures += check(session.branch_tool_token() >= 0,
+                          "combined output omitted branch gate token while undecided");
         // A discarded alternative must not select the publication branch.
         const auto alternative = fixture_tokenizer().encode(text == json ? call : json);
         (void)session.preview_model(alternative, alternative.size() + 1,
                                     infernix::FinishReason::OutputLimit);
         session.discard_preview();
         failures += check(session.constraint_observation()->branch ==
-                              infernix::ConstraintOutputBranch::Undecided,
-                          "discarded output selected a constraint branch");
+                              infernix::ConstraintOutputBranch::Undecided &&
+                              session.branch_tool_token() >= 0,
+                          "discarded output selected a constraint branch or cleared gate");
         const auto branch = text == json ? infernix::ConstraintOutputBranch::Content
                                          : infernix::ConstraintOutputBranch::Tools;
         std::string visible;
@@ -2410,8 +2419,9 @@ int test_tools_and_json_output() {
             (void)session.preview_model(std::span(&token, 1), 1000,
                                         infernix::FinishReason::OutputLimit);
             visible += channel_text(session.commit_preview(), infernix::OutputChannel::Content);
-            failures += check(session.constraint_observation()->branch == branch,
-                              "committed incomplete output lost its branch");
+            failures += check(session.constraint_observation()->branch == branch &&
+                                  session.branch_tool_token() < 0,
+                              "committed incomplete output lost its branch or kept gate");
         }
         auto complete = session.constraint_observation();
         failures += check(complete && complete->complete && !complete->terminated &&
@@ -2436,6 +2446,8 @@ int test_tools_and_json_output() {
     thinking_input.options.enable_thinking = true;
     auto thinking       = frontend.make_output_session(frontend.prepare(thinking_input), {}, {},
                                                        {.budget = 1}, body, choice);
+    failures += check(thinking.branch_tool_token() >= 0,
+                      "combined thinking output omitted branch gate token");
     const auto thought  = frontend.tokenize_text("x");
     const auto boundary = thinking.preview_model(thought, 1000, infernix::FinishReason::OutputLimit);
     failures +=
@@ -2456,7 +2468,8 @@ int test_tools_and_json_output() {
     failures += check(
         channel_text(thinking.commit_preview(), infernix::OutputChannel::Content) == json &&
             thinking.constraint_observation()->complete &&
-            thinking.constraint_observation()->branch == infernix::ConstraintOutputBranch::Content,
+            thinking.constraint_observation()->branch == infernix::ConstraintOutputBranch::Content &&
+            thinking.branch_tool_token() < 0,
         "thinking control changed the combined output language");
     input.options.continuation = infernix::PromptContinuationMode::ContinueFinalAssistant;
     input.messages.push_back(

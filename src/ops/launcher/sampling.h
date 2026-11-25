@@ -23,6 +23,11 @@ void sample_compact_launch(const Tensor& compact_ids, const Tensor& compact_logi
 void increment_token_counts_launch(const Tensor& token_ids, Tensor& token_counts,
                                    cudaStream_t stream);
 
+void filter_combined_branch_masks_launch(const Tensor& logits, std::int32_t token_domain,
+                                         const SamplingConfig* configs, cudaStream_t stream,
+                                         const Tensor& drafts, const Tensor& current_extents,
+                                         const Tensor& tree_rows);
+
 [[nodiscard]] std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain,
                                                          std::int32_t columns);
 

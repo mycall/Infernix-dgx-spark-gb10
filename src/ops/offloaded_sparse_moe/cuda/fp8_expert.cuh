@@ -98,7 +98,7 @@ constexpr int kFp8GateTiles = (moe::kIntermediate / kFp8Tile) * (moe::kHidden / 
 __global__ void __launch_bounds__(kGgmlThreads)
     gate_up_kernel_fp8(const std::uint8_t* __restrict__ x_limbs, const std::int32_t* __restrict__ x_emax,
                        MoeDispatch dispatch, MoeExpertSource source, int top_k,
-                       const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
+                       const std::uint8_t* const* job_records, const std::int32_t* cpu_flags,
                        int job_base, std::uint16_t* __restrict__ h_plane, PassPhase phase, int narrow_max) {
     constexpr int C     = kGgmlColumns;
     constexpr int kTiles = moe::kHidden / kFp8Tile; // 20 per row
@@ -157,8 +157,8 @@ __global__ void __launch_bounds__(kGgmlThreads)
 
 __global__ void __launch_bounds__(kGgmlThreads)
     down_kernel_fp8(MoeDispatch dispatch, MoeExpertSource source, int hidden,
-                    const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
-                    int job_base, const std::uint16_t* __restrict__ h_plane, bf16* __restrict__ outputs, PassPhase phase,
+                    const std::uint8_t* const* job_records, const std::int32_t* cpu_flags,
+                    int job_base, const std::uint16_t* h_plane, bf16* __restrict__ outputs, PassPhase phase,
                     int narrow_max) {
     constexpr int C      = kGgmlColumns;
     constexpr int kTiles = moe::kIntermediate / kFp8Tile; // 5 per row
@@ -391,7 +391,7 @@ __device__ __forceinline__ void compute(Shared& sm, RowOf row_of, int slices, Co
 __global__ void __launch_bounds__(fp8t::kThreads, 3)
     gate_up_tile_fp8(const std::uint8_t* __restrict__ x_limbs, const std::int32_t* __restrict__ x_emax,
                      MoeDispatch dispatch, MoeExpertSource source, int top_k,
-                     const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ tiles,
+                     const std::uint8_t* const* job_records, const std::int32_t* __restrict__ tiles,
                      const std::int32_t* __restrict__ first_tile, int job_base, int jobs, std::uint16_t* __restrict__ h_plane) {
     __shared__ fp8t::Shared sm;
     GgmlTile tl;
@@ -445,9 +445,9 @@ __global__ void __launch_bounds__(fp8t::kThreads, 3)
 
 __global__ void __launch_bounds__(fp8t::kThreads, 3)
     down_tile_fp8(MoeDispatch dispatch, MoeExpertSource source, int hidden,
-                  const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ tiles,
+                  const std::uint8_t* const* job_records, const std::int32_t* __restrict__ tiles,
                   const std::int32_t* __restrict__ first_tile, int job_base, int jobs,
-                  const std::uint16_t* __restrict__ h_plane, const std::int32_t* __restrict__ h_emax,
+                  const std::uint16_t* h_plane, const std::int32_t* __restrict__ h_emax,
                   bf16* __restrict__ outputs) {
     __shared__ fp8t::Shared sm;
     GgmlTile tl;

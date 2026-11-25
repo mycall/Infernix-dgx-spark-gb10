@@ -25,7 +25,7 @@ namespace infernix::ops::detail {
 // covers up to kMaxCols columns per CTA (grid.y slices beyond that).
 template <class S, bool FullRows, class Output, class Epilogue>
 __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void q8_a16_stream_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const __nv_bfloat16* x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue, int rows,
     int padded_k, int tokens, int token_begin) {
     constexpr int K      = S::kK;

@@ -382,6 +382,12 @@ struct Call {
                            std::int32_t top_k, std::int32_t max_jobs, std::int32_t pass_jobs,
                            const ExpertsWorkspace& workspace, Tensor& outputs, cudaStream_t stream);
 
+// Plans narrow GPU jobs and token->entry mappings and quantizes A4(x) into x_plane for persistent
+// 2..8-column OMMA decode/verification calls (no wide tiles or TMA descriptors needed).
+void prepare_xplane(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
+                    std::int32_t top_k, std::int32_t max_jobs, std::int32_t pass_jobs,
+                    const ExpertsWorkspace& workspace, cudaStream_t stream);
+
 // Computes the wide experts among the jobs of `pass`, whose records job_records holds by then:
 // the gate/up GEMM with SwiGLU and the encoding of h (A4, or the W4A16 limbs), then the down GEMM
 // into `outputs`.

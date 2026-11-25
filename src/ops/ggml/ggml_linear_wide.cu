@@ -34,7 +34,7 @@ inline constexpr int kPlaneTileBlocks = kPlaneTileThreads<F> == 512 ? 1 : 2;
 template <QType F, bool OutF32, bool Tiled>
 __global__ void __launch_bounds__(kPlaneTileThreads<F>, kPlaneTileBlocks<F>)
     tile_kernel(const std::uint8_t* __restrict__ weights, int rows, int row_bytes, int slices,
-                const std::int32_t* __restrict__ encoded, const std::int32_t* __restrict__ emax, int columns,
+                const std::int32_t* encoded, const std::int32_t* emax, int columns,
                 void* __restrict__ out, int n, int out_offset, const std::uint8_t* __restrict__ plane) {
     extern __shared__ __align__(16) unsigned char tile_shared[];
     auto& sm       = *reinterpret_cast<ggml::tile::PlaneShared*>(tile_shared);
@@ -86,7 +86,7 @@ inline constexpr int kDecodeTileThreads = 512;
 template <QType F, bool OutF32, bool Tiled>
 __global__ void __launch_bounds__(kDecodeTileThreads<F>, 1)
     decode_tile_kernel(const std::uint8_t* __restrict__ weights, int rows, int row_bytes, int slices,
-                       const std::int32_t* __restrict__ encoded, const std::int32_t* __restrict__ emax, int columns,
+                       const std::int32_t* encoded, const std::int32_t* emax, int columns,
                        void* __restrict__ out, int n, int out_offset) {
     extern __shared__ __align__(16) unsigned char decode_tile_shared[];
     using Sm       = ggml::tile::SharedT<ggml::tile::kRawChunksOf<F>>;

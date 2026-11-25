@@ -76,8 +76,11 @@ in the shared pool. To apply these defaults to an existing n1x-ai service, run
 See the [worker admission measurements](../bench/n1x/20261123-admission-experiments.md)
 and [host prefix-cache comparison](../bench/n1x/20261123-partition-comparison.md).
 
-It uses eager CUDA launches because sampled requests on the N1X produced non-finite logits
-with captured graphs. The endpoint becomes available after the model loads and warmup completes.
+The daily profile uses eager CUDA launches. After the November 24 upstream sync, captured
+graphs passed the previously failing seeded sampling check but missed one four-client
+inventory reply. Eager execution passed every inventory turn. See the
+[N1X comparison](gb10/20261124-changelog.md#cuda-graph-replay).
+The endpoint becomes available after the model loads and warmup completes.
 
 ### OpenCode lookup worker on N1X
 

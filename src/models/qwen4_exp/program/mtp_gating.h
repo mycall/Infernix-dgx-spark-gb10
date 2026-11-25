@@ -20,6 +20,7 @@
 
 #include "core/decode_graph.h"
 #include "infernix/ops/speculative_tree.h"
+#include "models/qwen3_5/ngram.h"
 
 #include <algorithm>
 #include <array>
@@ -408,15 +409,21 @@ struct RoundCostModel {
 
 // Eight-bucket confidence classifier combining SAM match length, occurrence multiplicity, recency,
 // and neural confirmation / post-neural stitching:
-//   0: short (<8)
-//   1: 8..11 single stale       2: 8..11 repeated (>=2 occ) or recent (<=2048 tok)
+//   0: short (<4, or 4..7 with occurrences < 3)
+//   1: 8..11 single stale (or 4..7 with occurrences >= 3)
+//   2: 8..11 repeated (>=2 occ) or recent (<=2048 tok) (or 6..7 with occurrences >= 6)
 //   3: 12..15 single stale      4: 12..15 repeated or recent
 //   5: 16+ single stale         6: 16+ repeated or recent
 //   7: neural-confirmed or post-neural stitched SAM suffix
 [[nodiscard]] inline int ngram_confidence_bucket(std::uint32_t matched, std::uint32_t occurrences,
                                                  std::uint32_t distance, bool mtp_confirmed = false) noexcept {
     if (mtp_confirmed) { return 7; }
-    if (matched < 8U) { return 0; }
+    if (matched < 8U) {
+        if (matched >= 4U && occurrences >= 3U) {
+            return (matched >= 6U && occurrences >= 6U) ? 2 : 1;
+        }
+        return 0;
+    }
     const bool strong = (occurrences >= 2U) || (distance <= 2048U);
     if (matched < 12U) { return strong ? 2 : 1; }
     if (matched < 16U) { return strong ? 4 : 3; }
@@ -534,6 +541,74 @@ inline void build_root_fork_tree_row(ops::SpeculativeTreeRow& row, std::int32_t 
         row.nodes = main_depth + 1;
         row.paths = 1;
     }
+}
+
+// Calibrates a binned per-step acceptance rate for D-Cut. Greedy chains use the bin table
+// directly; sampled chains (T > 0) scale the bin prior by the lane's online observed/expected
+// ratio from MtpCumulative and blend with the lane's per-position EMA acceptance so D-Cut
+// prunes low-survival sampled tails instead of trusting optimistic static bin priors.
+[[nodiscard]] inline double calibrate_dcut_rate(
+    float bin_rate, double observed, double expected, double lane_pos_accept, bool sampled) noexcept {
+    const double base = std::clamp(static_cast<double>(bin_rate), 0.0, 1.0);
+    if (!sampled) { return base; }
+    const double ratio  = expected >= 0.5 ? std::clamp(observed / expected, 0.25, 1.25) : 1.0;
+    const double scaled = std::clamp(base * ratio, 0.0, 1.0);
+    const double ema    = std::clamp(lane_pos_accept, 0.0, 1.0);
+    return 0.5 * scaled + 0.5 * ema;
+}
+
+// D-Cut cross-request verification budget pruning: given per-row surviving neural extents
+// (`row_extents[b]`, 0 for copy or inactive rows), per-step calibrated acceptance rates
+// (`row_rates[b][j]`), and round verification cost `cost_fn(w)` at shared width `w`, return
+// the shared cap `best_k` in `[0, max_ext]` maximizing batch-wide expected committed tokens
+// per unit round time. Ties keep the smaller `w` to save verification compute.
+template <class CostFn>
+[[nodiscard]] inline std::int32_t choose_dcut_batch_cap(
+    std::int32_t batch, std::span<const std::int32_t> row_extents,
+    std::span<const std::array<double, 8>> row_rates, CostFn&& cost_fn) noexcept {
+    if (batch <= 0 || row_extents.size() < static_cast<std::size_t>(batch) ||
+        row_rates.size() < static_cast<std::size_t>(batch)) {
+        return 0;
+    }
+    std::int32_t max_ext = 0;
+    for (std::int32_t b = 0; b < batch; ++b) {
+        max_ext = std::max(max_ext, std::clamp(row_extents[b], 0, 8));
+    }
+    if (batch <= 1 || max_ext <= 1) { return max_ext; }
+    std::int32_t best = 0;
+    double best_score = static_cast<double>(batch) / std::max(static_cast<double>(cost_fn(0)), 1e-6);
+    for (std::int32_t w = 1; w <= max_ext; ++w) {
+        double expected_tokens = 0.0;
+        for (std::int32_t b = 0; b < batch; ++b) {
+            expected_tokens += 1.0;
+            const std::int32_t lim = std::min(std::clamp(row_extents[b], 0, 8), w);
+            double reach           = 1.0;
+            for (std::int32_t j = 0; j < lim; ++j) {
+                reach *= std::clamp(row_rates[b][static_cast<std::size_t>(j)], 0.0, 1.0);
+                expected_tokens += reach;
+            }
+        }
+        const double score = expected_tokens / std::max(static_cast<double>(cost_fn(w)), 1e-6);
+        if (score > best_score) {
+            best_score = score;
+            best       = w;
+        }
+    }
+    return best;
+}
+
+// Selects between an in-request suffix match and a cross-request suffix match: in-request takes
+// precedence unless empty or strictly outmatched in matched prefix length (or continuation
+// length on ties).
+[[nodiscard]] inline qwen3_5::NgramMatch select_ngram_proposal(
+    qwen3_5::NgramMatch local, qwen3_5::NgramMatch cross) noexcept {
+    if (local.tokens.empty()) { return cross; }
+    if (!cross.tokens.empty() &&
+        (cross.matched > local.matched ||
+         (cross.matched == local.matched && cross.tokens.size() > local.tokens.size()))) {
+        return cross;
+    }
+    return local;
 }
 
 } // namespace infernix::models::qwen4_exp

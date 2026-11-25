@@ -196,10 +196,12 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
-    ops::sample(logits, state.execution.io.token,
-                dimension(state.execution.parameters.model.resources().public_token_count),
-                state.sampling, state.execution.io.pos, purpose, state.execution.work,
-                state.execution.device.stream);
+    const std::int32_t domain =
+        dimension(state.execution.parameters.model.resources().public_token_count);
+    ops::filter_combined_branch_masks(logits, domain, state.sampling,
+                                      state.execution.device.stream);
+    ops::sample(logits, state.execution.io.token, domain, state.sampling, state.execution.io.pos,
+                purpose, state.execution.work, state.execution.device.stream);
     state.execution.work.reset();
 }
 
@@ -241,13 +243,18 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
     grammar_dead_positions[0] = 0;
     const runtime::ForbiddenToken ft =
         (!execution_schedule.lossless && masks) ? masks->forbidden_token(0) : runtime::ForbiddenToken{};
+    const TokenId branch_tool =
+        (!execution_schedule.lossless && masks) ? masks->branch_tool_token(0) : -1;
     if (requests[lane].prefill && permit.main_frontier >= requests[lane].prefill->prompt_tokens &&
-        ((masks && masks->constrained(0)) || ft.token >= 0)) {
+        ((masks && masks->constrained(0)) || ft.token >= 0 || branch_tool >= 0)) {
         auto& config                 = static_cast<qwen3_5::PrefillRoundHost*>(round_host->data())->sampling;
         config                       = requests[lane].sampling_host;
         config.mask                  = fill_grammar_mask(masks, 0, {});
         config.forbidden_token       = ft.token;
         config.forbidden_until_token = ft.until_token;
+        config.branch_tool_token     = branch_tool;
+        config.branch_mask_words =
+            branch_tool >= 0 ? const_cast<std::uint32_t*>(config.mask.words) : nullptr;
         Tensor config_lane           = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
         CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &config, sizeof(config),
                                    cudaMemcpyHostToDevice, device.stream));

@@ -26,19 +26,40 @@ struct ProjectionFp32Output {
 using HeadSchedule   = Bf16A16SlicedKMmaSchedule<32, 16, 4, 64, 2, Cache::cg, Cache::ca, 2>;
 using HeadSchedule32 = Bf16A16SlicedKMmaSchedule<32, 32, 4, 64, 2, Cache::cg, Cache::ca, 2>;
 
+using RouterR16T16K256 = Bf16A16SlicedKMmaSchedule<16, 16, 8, 32, 2, Cache::cg, Cache::ca, 2>;
+using RouterR16T32K256 = Bf16A16SlicedKMmaSchedule<16, 32, 8, 32, 2, Cache::cg, Cache::ca, 2>;
+using RouterR16T16K64  = Bf16A16SlicedKMmaSchedule<16, 16, 4, 16, 2, Cache::cg, Cache::ca, 2>;
+using RouterR16T32K64  = Bf16A16SlicedKMmaSchedule<16, 32, 4, 16, 2, Cache::cg, Cache::ca, 2>;
+
 } // namespace
 
 bool projection_fp32_bf16_wide_mma_supported(int rows, int k) noexcept {
     return rows > 0 && rows % Bf16A16TmaR64T64K64S3::kBlockRows == 0 && k % Bf16A16TmaR64T64K64S3::kBlockK == 0;
 }
 
-// 64-token tiles up to 8,192 columns (a 512-row router's 4K chunk is 512 CTAs, 1.5 waves at two per SM), then
-// 128-token tiles.
+// Below 64 columns: the sliced-K BF16 tile on BlockRows = 16; 64..8,192 columns: 64-token TMA tiles;
+// above 8,192 columns: 128-token TMA tiles.
 void projection_fp32_bf16_wide_mma(const Tensor& x, const void* weight, int rows, int out_rows, float* out,
                                    cudaStream_t stream) {
     const Bf16A16Operands p{static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight),
                             rows, static_cast<int>(x.ne[0]), static_cast<int>(x.ne[1])};
     const ProjectionFp32Output output{out, out_rows};
+    if (p.tokens < 64) {
+        if (p.k % 256 == 0) {
+            if (p.tokens <= 16) {
+                launch_bf16_a16_sliced_k_mma<RouterR16T16K256>(p, output, LinearIdentityEpilogue{}, stream);
+            } else {
+                launch_bf16_a16_sliced_k_mma<RouterR16T32K256>(p, output, LinearIdentityEpilogue{}, stream);
+            }
+        } else {
+            if (p.tokens <= 16) {
+                launch_bf16_a16_sliced_k_mma<RouterR16T16K64>(p, output, LinearIdentityEpilogue{}, stream);
+            } else {
+                launch_bf16_a16_sliced_k_mma<RouterR16T32K64>(p, output, LinearIdentityEpilogue{}, stream);
+            }
+        }
+        return;
+    }
     if (p.tokens > 512 && rows <= 2048) {
         launch_bf16_a16_tma_mma<Bf16A16TmaR64T128K64S2Rows>(p, output, LinearIdentityEpilogue{}, stream);
     } else if (p.tokens <= 8192) {

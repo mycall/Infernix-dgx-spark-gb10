@@ -130,8 +130,8 @@ __global__ void __launch_bounds__(kNvfp4A8EncodeThreads)
 template <class G>
 __global__ void __launch_bounds__(kNvfp4A8Threads, kNvfp4A8MinBlocks)
     gate_up_kernel_nvfp4_a8(const std::uint8_t* __restrict__ x_rows, MoeDispatch dispatch, MoeExpertSource source,
-                            int top_k, const std::uint8_t* const* __restrict__ job_records,
-                            const std::int32_t* __restrict__ cpu_flags, int job_base,
+                            int top_k, const std::uint8_t* const* job_records,
+                            const std::int32_t* cpu_flags, int job_base,
                             std::uint16_t* __restrict__ h_plane, PassPhase phase, int narrow_max) {
     using S         = Nvfp4A8Shape<G>;
     constexpr int C = kA8Columns;
@@ -238,9 +238,9 @@ __global__ void __launch_bounds__(kNvfp4A8Threads, kNvfp4A8MinBlocks)
 
 template <class G>
 __global__ void __launch_bounds__(kNvfp4A8Threads, kNvfp4A8MinBlocks)
-    down_kernel_nvfp4_a8(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* __restrict__ job_records,
-                         const std::int32_t* __restrict__ cpu_flags, int job_base,
-                         const std::uint16_t* __restrict__ h_plane, bf16* __restrict__ outputs, PassPhase phase,
+    down_kernel_nvfp4_a8(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* job_records,
+                         const std::int32_t* cpu_flags, int job_base,
+                         const std::uint16_t* h_plane, bf16* __restrict__ outputs, PassPhase phase,
                          int narrow_max) {
     using S         = Nvfp4A8Shape<G>;
     constexpr int C = kA8Columns;

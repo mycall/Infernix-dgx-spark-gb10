@@ -141,27 +141,27 @@ Model loading takes **8s**; full engine startup and graph initialization takes *
 
 | Test | c | pp t/s | tg t/s | TTFT (ms) | Total (ms) |
 |---|---:|---:|---:|---:|---:|
-| pp2048 tg128 @ d0 | c1 | 3,058* | 102.6 | 670 | 1,907 |
-| pp2048 tg128 @ d0 | c2 | 3,108 | 129.8 | 1,325 | 3,195 |
-| pp2048 tg128 @ d0 | c4 | 3,202 | 167.3 | 2,571 | 5,409 |
-| pp2048 tg128 @ d4096 | c1 | 3,823* | 97.4 | 1,607 | 2,911 |
-| pp2048 tg128 @ d4096 | c2 | 3,823 | 123.4 | 3,223 | 5,258 |
-| pp2048 tg128 @ d4096 | c4 | 3,816 | 166.0 | 6,455 | 9,399 |
-| pp2048 tg128 @ d8192 | c1 | 4,035* | 100.5 | 2,538 | 3,802 |
-| pp2048 tg128 @ d8192 | c2 | 4,036 | 116.9 | 5,082 | 7,205 |
-| pp2048 tg128 @ d8192 | c4 | 4,041 | 161.1 | 10,151 | 13,144 |
+| pp2048 tg128 @ d0 | c1 | 3,510* | 101.2 | 584 | 1,838 |
+| pp2048 tg128 @ d0 | c2 | 3,305 | 141.5 | 1,121 | 2,865 |
+| pp2048 tg128 @ d0 | c4 | 3,328 | 204.0 | 2,233 | 4,656 |
+| pp2048 tg128 @ d4096 | c1 | 4,300* | 98.7 | 1,429 | 2,715 |
+| pp2048 tg128 @ d4096 | c2 | 3,972 | 128.3 | 2,820 | 4,768 |
+| pp2048 tg128 @ d4096 | c4 | 4,037 | 197.7 | 5,591 | 8,047 |
+| pp2048 tg128 @ d8192 | c1 | 4,565* | 90.7 | 2,243 | 3,643 |
+| pp2048 tg128 @ d8192 | c2 | 4,213 | 128.0 | 4,416 | 6,371 |
+| pp2048 tg128 @ d8192 | c4 | 4,220 | 197.5 | 8,801 | 11,294 |
 
 \* `c = 1` prefill column is an estimator output, not wall-clock throughput — only `TTFT`-derived rates are meaningful at `c = 1`.
 
-### `tool-eval-bench` Results (`HC4-W4Dense`, `tool-eval-bench v3.0.1.dev15+gea2a77499`)
+### `tool-eval-bench` Results (`HC4-W4Dense`, `tool-eval-bench v3.0.1.dev10+g1cd7309e5`)
 
 | Metric | Value |
 |---|---|
-| **Score** | **96 / 100** (`133 / 138` points, ★★★★★ Excellent) |
-| **Scenarios** | **65 passed**, **3 partial**, **1 failed** |
-| **Quality** | **96 / 100** |
-| **Responsiveness** | **60 / 100** (median turn: **2.3s**) |
-| **Deployability** | **85 / 100** (`α = 0.7`) |
+| **Score** | **99 / 100** (`136 / 138` points, ★★★★★ Excellent) |
+| **Scenarios** | **68 passed**, **0 partial**, **1 failed** |
+| **Quality** | **99 / 100** |
+| **Responsiveness** | **67 / 100** (median turn: **1.9s**) |
+| **Deployability** | **89 / 100** (`α = 0.7`) |
 
 ---
 

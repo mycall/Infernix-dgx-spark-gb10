@@ -47,14 +47,16 @@ void bf16_general_gemm(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     const std::int32_t N = weight.n;
     const std::int32_t K = weight.k;
     const std::int32_t T = x.ne[1];
-    // Route aligned BF16-output runtime shapes onto Tensor Core MMA instead of the SIMT fallback.
-    if (out.dtype == DType::BF16 && N > 0 && K > 0 && (N % 32) == 0 && (K % 128) == 0 &&
-        reinterpret_cast<std::uintptr_t>(weight.qdata) % 16 == 0 &&
+    // Route aligned BF16 and FP32 runtime shapes onto Tensor Core MMA instead of the SIMT fallback.
+    // Sharing the same MMA kernel for BF16 and FP32 outputs guarantees bit-exact rounding parity
+    // (f32_to_bf16(fp32_out) == bf16_out) for vocabulary heads at T > 8.
+    if ((out.dtype == DType::BF16 || out.dtype == DType::FP32) && N > 0 && K > 0 && (N % 32) == 0 &&
+        (K % 128) == 0 && reinterpret_cast<std::uintptr_t>(weight.qdata) % 16 == 0 &&
         reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0) {
-        launch_bf16_a16_mma<Bf16A16MmaR32T32K128S3>(
-            bf16_a16_operands(x, weight),
-            LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), N},
-            LinearIdentityEpilogue{}, stream);
+        with_linear_output(out, N, [&](auto output) {
+            launch_bf16_a16_mma<Bf16A16MmaR32T32K128S3>(bf16_a16_operands(x, weight), output,
+                                                       LinearIdentityEpilogue{}, stream);
+        });
         return;
     }
     const dim3 grid(static_cast<unsigned>((N + kTileN - 1) / kTileN),

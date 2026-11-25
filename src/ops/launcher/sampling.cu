@@ -97,4 +97,35 @@ void increment_token_counts_launch(const Tensor& token_ids, Tensor& token_counts
     CUDA_CHECK(cudaGetLastError());
 }
 
+void filter_combined_branch_masks_launch(const Tensor& logits, std::int32_t token_domain,
+                                         const SamplingConfig* configs, cudaStream_t stream,
+                                         const Tensor& drafts, const Tensor& current_extents,
+                                         const Tensor& tree_rows) {
+    const std::int32_t physical_rows = logits.ne[0];
+    const bool has_drafts            = drafts.data != nullptr;
+    const std::int32_t cols          = has_drafts ? drafts.ne[0] + 1 : 1;
+    const std::int32_t batch         = has_drafts ? drafts.ne[1] : logits.ne[1];
+    const std::int32_t drafts_k      = has_drafts ? drafts.ne[0] : 0;
+    const dim3 grid(static_cast<unsigned int>(cols), static_cast<unsigned int>(batch));
+    const auto* drafts_ptr  = has_drafts ? static_cast<const std::int32_t*>(drafts.data) : nullptr;
+    const auto* extents_ptr = current_extents.data != nullptr
+                                  ? static_cast<const std::int32_t*>(current_extents.data)
+                                  : nullptr;
+    const auto* trees_ptr   = tree_rows.data != nullptr
+                                  ? static_cast<const SpeculativeTreeRow*>(tree_rows.data)
+                                  : nullptr;
+    if (logits.dtype == DType::BF16) {
+        filter_combined_branch_masks_kernel<__nv_bfloat16>
+            <<<grid, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data), configs,
+                                       drafts_ptr, extents_ptr, trees_ptr, token_domain,
+                                       physical_rows, cols, drafts_k);
+    } else {
+        filter_combined_branch_masks_kernel<float>
+            <<<grid, 256, 0, stream>>>(static_cast<const float*>(logits.data), configs, drafts_ptr,
+                                       extents_ptr, trees_ptr, token_domain, physical_rows, cols,
+                                       drafts_k);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace infernix::ops::detail

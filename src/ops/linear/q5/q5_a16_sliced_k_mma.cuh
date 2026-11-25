@@ -44,7 +44,7 @@ __device__ __forceinline__ int q5_sliced_k_swizzle(int row, int col) {
 template <class Schedule, bool Full, bool FullTokens, class Output, class Epilogue, class RowPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sliced_k_mma_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const __nv_bfloat16* x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales, Output output,
     Epilogue epilogue, int rows, int k, int tokens, int padded_k, int token_begin,
     RowPolicy row_policy) {

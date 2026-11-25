@@ -117,7 +117,7 @@ __device__ __forceinline__ int qsa_logical_position(const std::int32_t* __restri
 }
 
 __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
-    qsa_score_kernel(const bf16* __restrict__ index_q, int index_heads, const bf16* __restrict__ pooled,
+    qsa_score_kernel(const bf16* index_q, int index_heads, const bf16* pooled,
                      const std::int32_t* __restrict__ tables, int table_stride,
                      const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
                      const SpeculativeTreeRow* __restrict__ trees, int width, int ratio, int top_blocks,
@@ -343,7 +343,7 @@ __device__ __forceinline__ void wide_leaves(const float4* __restrict__ query, co
 // Warp w scores columns 4 (w % 4) .. + 3 (lane / 8) against blocks 16 (w / 4) + lane % 8 + 8 i of
 // each key tile. Arguments as qsa_score_kernel's.
 __global__ void __launch_bounds__(kWideThreads, kWideCtasPerSm)
-    qsa_score_wide_kernel(const bf16* __restrict__ index_q, int index_heads, const bf16* __restrict__ pooled,
+    qsa_score_wide_kernel(const bf16* index_q, int index_heads, const bf16* pooled,
                           const std::int32_t* __restrict__ tables, int table_stride,
                           const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
                           const SpeculativeTreeRow* __restrict__ trees, int width, int ratio, int top_blocks,
@@ -504,7 +504,7 @@ struct MmaWorkMap {
 
 template <int Tile, bool Vector, int Stages, bool RetainKeys = false>
 __global__ void __launch_bounds__(Tile > 16 ? Tile * 8 : 128)
-    qsa_score_mma_kernel(const bf16* __restrict__ index_q, int index_heads, const bf16* __restrict__ pooled,
+    qsa_score_mma_kernel(const bf16* index_q, int index_heads, const bf16* pooled,
                          const std::int32_t* __restrict__ tables, int table_stride,
                          const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
                          const SpeculativeTreeRow* __restrict__ trees, int width, int ratio, int top_blocks,

@@ -59,6 +59,12 @@ struct SamplingConfig {
     // (e.g. `</think>`). Negative values disable it.
     std::int32_t forbidden_token       = -1;
     std::int32_t forbidden_until_token = -1;
+    // Optional combined-branch gate token (e.g. `<tool_call>` inside `Union(structured, tools)`).
+    // When non-negative and `branch_mask_words` is non-null, `filter_combined_branch_masks`
+    // clears bit `branch_tool_token` in the active mask column when unconstrained argmax prefers a
+    // masked token and another valid alternative exists in the mask.
+    std::int32_t branch_tool_token   = -1;
+    std::uint32_t* branch_mask_words = nullptr;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -117,6 +123,17 @@ struct SamplingConfig {
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
             WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Filter active combined-branch grammar masks in place when the unconstrained penalty-adjusted
+ * argmax prefers a token disallowed by the mask while both `branch_tool_token` and at least one
+ * alternative token are permitted, preventing masked content openers from locking the grammar into
+ * the tool-call branch.
+ */
+void filter_combined_branch_masks(const Tensor& logits, std::int32_t token_domain,
+                                  const SamplingConfig* configs, cudaStream_t stream,
+                                  const Tensor& drafts = {}, const Tensor& current_extents = {},
+                                  const Tensor& tree_rows = {});
 
 /**
  * Compact-candidate form of sample(): samples from compact_ids I32 [cap, B], compact_logits FP32

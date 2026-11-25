@@ -63,6 +63,9 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
             state.execution.io, logits, nullptr,
             dimension(state.execution.parameters.model.resources().public_token_count),
             state.execution.device.stream);
+        ops::filter_combined_branch_masks(
+            logits, dimension(state.execution.parameters.model.resources().public_token_count),
+            ordinary.sampling, state.execution.device.stream);
         ops::sample(logits, sampled,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     ordinary.sampling, cache_positions, ops::kSamplePurposeDecode,
@@ -366,6 +369,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
                 const auto ft = masks->forbidden_token(row);
                 ordinary_host_ingress->sampling[row].forbidden_token       = ft.token;
                 ordinary_host_ingress->sampling[row].forbidden_until_token = ft.until_token;
+                const TokenId branch_tool = masks->branch_tool_token(row);
+                ordinary_host_ingress->sampling[row].branch_tool_token = branch_tool;
+                ordinary_host_ingress->sampling[row].branch_mask_words =
+                    branch_tool >= 0 ? const_cast<std::uint32_t*>(ordinary_host_ingress->sampling[row].mask.words) : nullptr;
             }
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
@@ -803,6 +810,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                 const auto ft = masks->forbidden_token(row);
                 mtp_host_ingress->sampling[row].forbidden_token       = ft.token;
                 mtp_host_ingress->sampling[row].forbidden_until_token = ft.until_token;
+                const TokenId branch_tool = masks->branch_tool_token(row);
+                mtp_host_ingress->sampling[row].branch_tool_token = branch_tool;
+                mtp_host_ingress->sampling[row].branch_mask_words =
+                    branch_tool >= 0 ? const_cast<std::uint32_t*>(mtp_host_ingress->sampling[row].mask.words) : nullptr;
             }
             mtp_host_ingress->proposal_limits[row]         = static_cast<std::int32_t>(proposal_limit);
             if (execution_schedule.sampled_mtp_drafts) {
@@ -1263,6 +1274,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 const auto ft = masks->forbidden_token(row);
                 dflash_host_ingress->sampling[row].forbidden_token       = ft.token;
                 dflash_host_ingress->sampling[row].forbidden_until_token = ft.until_token;
+                const TokenId branch_tool = masks->branch_tool_token(row);
+                dflash_host_ingress->sampling[row].branch_tool_token = branch_tool;
+                dflash_host_ingress->sampling[row].branch_mask_words =
+                    branch_tool >= 0 ? const_cast<std::uint32_t*>(dflash_host_ingress->sampling[row].mask.words) : nullptr;
             }
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
                                       backend_kv_cache() ? frontier : 0U);

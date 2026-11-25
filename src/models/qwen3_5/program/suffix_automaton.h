@@ -28,8 +28,15 @@ public:
         int32_t len = 0;
     };
 
-    explicit SuffixAutomaton(std::size_t token_capacity = 1U << 20)
-        : token_capacity_(power_of_two(token_capacity) && token_capacity >= 64 ? token_capacity : 0) {
+    struct Cursor {
+        int32_t state            = 0;
+        int32_t matched          = 0;
+        std::uint64_t generation = 0;
+    };
+
+    explicit SuffixAutomaton(std::size_t token_capacity = 1U << 20, bool compact_enabled = true)
+        : token_capacity_(power_of_two(token_capacity) && token_capacity >= 64 ? token_capacity : 0),
+          compact_enabled_(compact_enabled) {
         if (token_capacity_ == 0) {
             throw std::invalid_argument("invalid suffix automaton capacity");
         }
@@ -39,6 +46,7 @@ public:
     [[nodiscard]] std::size_t capacity() const noexcept { return token_capacity_; }
     [[nodiscard]] std::size_t size() const noexcept { return tokens_.size(); }
     [[nodiscard]] std::size_t node_count() const noexcept { return nodes_.size(); }
+    [[nodiscard]] std::uint64_t generation() const noexcept { return generation_; }
 
     void clear() {
         nodes_.clear();
@@ -48,6 +56,7 @@ public:
         tokens_.clear();
         nodes_.push_back(Node{});
         last_ = 0;
+        ++generation_;
     }
 
     void boundary() {
@@ -123,6 +132,45 @@ public:
         };
     }
 
+    void advance_cursor(Cursor& c, Token t) const noexcept {
+        if (c.generation != generation_) {
+            c.state      = 0;
+            c.matched    = 0;
+            c.generation = generation_;
+        }
+        if (is_boundary(t)) {
+            c.state   = 0;
+            c.matched = 0;
+            return;
+        }
+        int32_t state   = normalize_state(c.state, c.matched);
+        int32_t matched = state == 0 ? 0 : c.matched;
+        while (state != -1 && get_transition(state, t) == -1) {
+            state   = nodes_[state].link;
+            matched = state != -1 ? nodes_[state].len : 0;
+        }
+        if (state == -1) {
+            c.state   = 0;
+            c.matched = 0;
+        } else {
+            c.state   = get_transition(state, t);
+            c.matched = matched + 1;
+        }
+    }
+
+    [[nodiscard]] Cursor cursor_from(std::span<const Token> history) const noexcept {
+        Cursor c{0, 0, generation_};
+        for (const auto t : history) { advance_cursor(c, t); }
+        return c;
+    }
+
+    [[nodiscard]] Match propose_from_cursor(const Cursor& c, std::uint32_t maximum,
+                                            std::uint32_t minimum_match = 12) const {
+        if (maximum == 0 || c.generation != generation_ || c.state == 0) { return {}; }
+        const int32_t state = normalize_state(c.state, c.matched);
+        return propose_from_state(state, c.matched, maximum, minimum_match);
+    }
+
     [[nodiscard]] Match propose(std::span<const Token> history, std::uint32_t maximum,
                                 std::uint32_t minimum_match = 12) const {
         Match match;
@@ -170,17 +218,24 @@ public:
                 }
             }
         }
+        return propose_from_state(state, matched, maximum, minimum_match);
+    }
 
-        if (state == 0 || matched < static_cast<int32_t>(minimum_match)) {
+    [[nodiscard]] Match propose_from_state(int32_t state, int32_t matched, std::uint32_t maximum,
+                                           std::uint32_t minimum_match) const {
+        Match match;
+        if (maximum == 0 || state <= 0 || matched < static_cast<int32_t>(minimum_match)) {
             return match;
         }
 
         const auto n_tokens = static_cast<int32_t>(tokens_.size());
         const auto live     = static_cast<int32_t>(live_begin());
         int32_t best_pos    = -1;
+        int32_t alt_pos     = -1;
+        uint32_t alt_freq   = 0;
 
         while (state != 0 && matched >= static_cast<int32_t>(minimum_match)) {
-            best_pos = best_lookup_candidate(state, matched, live, n_tokens);
+            best_pos = best_lookup_candidate(state, matched, live, n_tokens, &alt_pos, nullptr, &alt_freq);
             if (best_pos >= 0) { break; }
             state = nodes_[state].link;
             if (state > 0) { matched = std::min(matched, nodes_[state].len); }
@@ -202,6 +257,10 @@ public:
         match.matched     = static_cast<uint32_t>(matched);
         match.occurrences = nodes_[state].occ_count;
         match.distance    = static_cast<uint32_t>(n_tokens - 1 - best_pos);
+        if (alt_pos >= 0) {
+            match.alt_token       = tokens_[alt_pos + 1];
+            match.alt_occurrences = alt_freq;
+        }
         match.tokens.resize(avail);
         for (uint32_t i = 0; i < avail; ++i) {
             match.tokens[i] = tokens_[match_end + i];
@@ -253,6 +312,8 @@ private:
         int32_t prev_pos       = -1;
         int32_t valid_pos      = -1;
         int32_t prev_valid_pos = -1;
+        int32_t top_pos        = -1;
+        int32_t alt_pos        = -1;
         uint32_t occ_count     = 0;
         Token first_key        = -1;
         int32_t first_to       = -1;
@@ -266,20 +327,31 @@ private:
     };
 
     std::size_t token_capacity_ = 0;
+    bool compact_enabled_       = true;
     std::vector<Node> nodes_;
     std::vector<Edge> edges_;
     std::vector<EdgeSlot> edge_table_;
     std::size_t edge_table_count_ = 0;
     std::vector<Token> tokens_;
     std::vector<Token> boundaries_;
-    int32_t last_ = 0;
+    int32_t last_            = 0;
+    std::uint64_t generation_ = 1;
+
+    [[nodiscard]] int32_t normalize_state(int32_t state, int32_t matched) const noexcept {
+        if (state <= 0 || matched <= 0) { return 0; }
+        while (state > 0 && nodes_[state].link >= 0 && nodes_[nodes_[state].link].len >= matched) {
+            state = nodes_[state].link;
+        }
+        return state;
+    }
 
     void append_non_boundary(Token token) {
+        const int32_t prev_last = last_;
+        const int32_t prev_end  = !tokens_.empty() ? static_cast<int32_t>(tokens_.size()) - 1 : -1;
         // The non-boundary token being appended confirms that the previous tip ended a valid
         // continuation for `last_` and its suffix ancestors.
-        if (last_ != 0 && !tokens_.empty()) {
-            const int32_t prev_end = static_cast<int32_t>(tokens_.size()) - 1;
-            int32_t u              = last_;
+        if (prev_last != 0 && prev_end >= 0) {
+            int32_t u = prev_last;
             for (int32_t hops = 0; u > 0 && hops < kMaxPropagateHops; ++hops) {
                 if (nodes_[u].valid_pos != prev_end) {
                     nodes_[u].prev_valid_pos = nodes_[u].valid_pos;
@@ -326,6 +398,8 @@ private:
                     .prev_pos       = nodes_[q].prev_pos,
                     .valid_pos      = nodes_[q].valid_pos,
                     .prev_valid_pos = nodes_[q].prev_valid_pos,
+                    .top_pos        = nodes_[q].top_pos,
+                    .alt_pos        = nodes_[q].alt_pos,
                     .occ_count      = nodes_[q].occ_count,
                     .first_key      = -1,
                     .first_to       = -1,
@@ -357,10 +431,43 @@ private:
             u = nodes_[u].link;
         }
 
+        // Maintain top-2 highest-frequency distinct continuation slots (`top_pos`, `alt_pos`) on
+        // each ancestor of the previous tip after transition occurrence counts have settled.
+        if (prev_last != 0 && prev_end >= 0) {
+            const int32_t live_floor = static_cast<int32_t>(live_begin());
+            const auto freq_at = [&](int32_t node, int32_t pos) noexcept -> uint32_t {
+                if (pos < live_floor || pos + 1 >= static_cast<int32_t>(tokens_.size()) ||
+                    is_boundary(tokens_[pos + 1])) {
+                    return 0U;
+                }
+                const int32_t nx = get_transition(node, tokens_[pos + 1]);
+                return nx > 0 ? nodes_[nx].occ_count : 1U;
+            };
+            int32_t pu = prev_last;
+            for (int32_t hops = 0; pu > 0 && hops < kMaxPropagateHops; ++hops) {
+                const uint32_t f_new = freq_at(pu, prev_end);
+                Node& pnd            = nodes_[pu];
+                const uint32_t f_top = freq_at(pu, pnd.top_pos);
+                if (pnd.top_pos < 0 || f_top == 0U || tokens_[pnd.top_pos + 1] == token) {
+                    pnd.top_pos = prev_end;
+                } else if (f_new > f_top) {
+                    pnd.alt_pos = pnd.top_pos;
+                    pnd.top_pos = prev_end;
+                } else {
+                    const uint32_t f_alt = freq_at(pu, pnd.alt_pos);
+                    if (pnd.alt_pos < 0 || f_alt == 0U || tokens_[pnd.alt_pos + 1] == token || f_new >= f_alt) {
+                        pnd.alt_pos = prev_end;
+                    }
+                }
+                pu = nodes_[pu].link;
+            }
+        }
+
         last_ = cur;
     }
 
     void compact_if_needed() {
+        if (!compact_enabled_) { return; }
         const std::size_t trigger = std::max<std::size_t>(2U * token_capacity_, 1024U);
         if (tokens_.size() < trigger) { return; }
         const std::size_t keep = std::min(token_capacity_, tokens_.size());
@@ -378,19 +485,44 @@ private:
     }
 
     [[nodiscard]] int32_t best_lookup_candidate(int32_t state, int32_t matched, int32_t live,
-                                                int32_t n_tokens) const noexcept {
-        const Node& nd    = nodes_[state];
-        int32_t best      = -1;
-        const auto check  = [&](int32_t p) noexcept {
-            if (p >= 0 && p + 1 < n_tokens && p - matched + 1 >= live &&
-                !is_boundary(tokens_[p + 1]) && p > best) {
-                best = p;
+                                                int32_t n_tokens, int32_t* alt_pos = nullptr,
+                                                uint32_t* best_freq_out = nullptr,
+                                                uint32_t* alt_freq_out = nullptr) const noexcept {
+        const Node& nd     = nodes_[state];
+        int32_t best       = -1;
+        uint32_t best_freq = 0;
+        const int32_t cands[6]{nd.top_pos, nd.alt_pos, nd.valid_pos, nd.prev_valid_pos, nd.last_pos, nd.prev_pos};
+        for (const int32_t p : cands) {
+            if (p >= 0 && p + 1 < n_tokens && p - matched + 1 >= live && !is_boundary(tokens_[p + 1])) {
+                const int32_t next_state = get_transition(state, tokens_[p + 1]);
+                const uint32_t freq      = next_state > 0 ? nodes_[next_state].occ_count : 1U;
+                if (freq > best_freq || (freq == best_freq && p > best)) {
+                    best_freq = freq;
+                    best      = p;
+                }
             }
-        };
-        check(nd.valid_pos);
-        check(nd.prev_valid_pos);
-        check(nd.last_pos);
-        check(nd.prev_pos);
+        }
+        if (best_freq_out != nullptr) { *best_freq_out = best_freq; }
+        if (alt_pos != nullptr) {
+            int32_t alt       = -1;
+            uint32_t alt_freq = 0;
+            if (best >= 0) {
+                const Token best_tok = tokens_[best + 1];
+                for (const int32_t p : cands) {
+                    if (p >= 0 && p + 1 < n_tokens && p - matched + 1 >= live &&
+                        !is_boundary(tokens_[p + 1]) && tokens_[p + 1] != best_tok) {
+                        const int32_t next_state = get_transition(state, tokens_[p + 1]);
+                        const uint32_t freq      = next_state > 0 ? nodes_[next_state].occ_count : 1U;
+                        if (freq > alt_freq || (freq == alt_freq && p > alt)) {
+                            alt_freq = freq;
+                            alt      = p;
+                        }
+                    }
+                }
+            }
+            *alt_pos = alt;
+            if (alt_freq_out != nullptr) { *alt_freq_out = alt_freq; }
+        }
         return best;
     }
 
@@ -493,6 +625,110 @@ private:
             nodes_[dst].next_edge = new_edge;
             put_edge_table(dst, edges_[e].key, edges_[e].to);
         }
+    }
+};
+
+// Non-blocking dual-generation SAM: swaps active and standby banks in O(1) when the active bank
+// reaches capacity, eliminating stop-the-world 262K-token rebuild spikes during long runs while
+// keeping the prior bank warm for immediate queries.
+class DualGenSuffixAutomaton {
+public:
+    using Token = SuffixAutomaton::Token;
+    using Match = SuffixAutomaton::Match;
+
+    struct Cursor {
+        SuffixAutomaton::Cursor active{};
+        SuffixAutomaton::Cursor standby{};
+        std::uint64_t generation = 0;
+    };
+
+    explicit DualGenSuffixAutomaton(std::size_t total_capacity = 1U << 18)
+        : bank_capacity_(bank_cap_for(total_capacity)),
+          active_(bank_capacity_, /*compact_enabled=*/false),
+          standby_(bank_capacity_, /*compact_enabled=*/false) {}
+
+    [[nodiscard]] std::size_t capacity() const noexcept { return bank_capacity_ * 2; }
+    [[nodiscard]] std::size_t bank_capacity() const noexcept { return bank_capacity_; }
+    [[nodiscard]] std::uint64_t generation() const noexcept { return generation_; }
+    [[nodiscard]] std::size_t active_size() const noexcept { return active_.size(); }
+    [[nodiscard]] std::size_t standby_size() const noexcept { return standby_.size(); }
+
+    void clear() {
+        active_.clear();
+        standby_.clear();
+        ++generation_;
+    }
+
+    void set_boundaries(std::vector<Token> tokens) {
+        active_.set_boundaries(tokens);
+        standby_.set_boundaries(std::move(tokens));
+    }
+
+    void ingest(std::span<const Token> tokens) {
+        if (tokens.empty()) { return; }
+        const std::size_t max_single = bank_capacity_ > 2 ? bank_capacity_ - 2 : tokens.size();
+        if (tokens.size() > max_single) {
+            tokens = tokens.last(max_single);
+        }
+        const std::size_t need = tokens.size() + 2;
+        if (active_.size() > 0 && active_.size() + need > bank_capacity_) {
+            std::swap(standby_, active_);
+            active_.clear();
+            ++generation_;
+        }
+        active_.ingest(tokens);
+    }
+
+    void advance_cursor(Cursor& c, Token token) const noexcept {
+        if (c.generation != generation_) { return; }
+        active_.advance_cursor(c.active, token);
+        standby_.advance_cursor(c.standby, token);
+    }
+
+    [[nodiscard]] Cursor cursor_from(std::span<const Token> history) const noexcept {
+        return Cursor{
+            .active     = active_.cursor_from(history),
+            .standby    = standby_.cursor_from(history),
+            .generation = generation_,
+        };
+    }
+
+    [[nodiscard]] Match propose(std::span<const Token> history, std::uint32_t maximum,
+                                std::uint32_t minimum_match = 12) const {
+        return pick_better(active_.propose(history, maximum, minimum_match),
+                           standby_.propose(history, maximum, minimum_match));
+    }
+
+    [[nodiscard]] Match propose_from_cursor(const Cursor& c, std::uint32_t maximum,
+                                            std::uint32_t minimum_match = 12) const {
+        if (c.generation != generation_) { return {}; }
+        return pick_better(active_.propose_from_cursor(c.active, maximum, minimum_match),
+                           standby_.propose_from_cursor(c.standby, maximum, minimum_match));
+    }
+
+private:
+    std::size_t bank_capacity_ = 0;
+    SuffixAutomaton active_;
+    SuffixAutomaton standby_;
+    std::uint64_t generation_ = 1;
+
+    [[nodiscard]] static std::size_t bank_cap_for(std::size_t total_capacity) {
+        if (total_capacity < 128 || (total_capacity & (total_capacity - 1)) != 0) {
+            throw std::invalid_argument("invalid dual-gen suffix automaton capacity");
+        }
+        return std::max<std::size_t>(total_capacity / 2, 64);
+    }
+
+    [[nodiscard]] static Match pick_better(Match a, Match b) noexcept {
+        if (a.tokens.empty()) { return b; }
+        if (!b.tokens.empty() &&
+            (b.matched > a.matched ||
+             (b.matched == a.matched &&
+              (b.occurrences > a.occurrences ||
+               (b.occurrences == a.occurrences && b.tokens.size() > a.tokens.size()))))) {
+            return b;
+        }
+        return a;
     }
 };
 

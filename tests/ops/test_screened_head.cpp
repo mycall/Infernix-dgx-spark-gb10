@@ -621,12 +621,12 @@ void logits_case(LogitsHead& head, std::uint64_t seed) {
     {
         const auto wide_cols = make_columns(head.values, head.rows, 32, seed + 17, false);
         int wide_differs     = 0;
-        for (const std::int32_t T : {24, 32}) {
+        for (const std::int32_t T : {20, 24, 28, 32}) {
             check_logits_call(head, wide_cols, T, policy, work, head.label + " wide T=" + std::to_string(T),
                               {0, 16, T - 1}, wide_differs);
         }
-        std::cout << head.label << ": wide argmax differs in " << wide_differs << " of 56 columns\n";
-        check(wide_differs <= 2, head.label + ": wide screened argmax matches the full head on structured columns");
+        std::cout << head.label << ": wide argmax differs in " << wide_differs << " of 112 columns\n";
+        check(wide_differs <= 4, head.label + ": wide screened argmax matches the full head on structured columns");
         {
             const auto cols48 = make_columns(head.values, head.rows, 48, seed + 23, false);
             int differs48     = 0;
@@ -642,6 +642,17 @@ void logits_case(LogitsHead& head, std::uint64_t seed) {
         check(std::memcmp(out32.data() + static_cast<std::size_t>(16) * head.rows, out16.data(),
                           sizeof(float) * head.rows) == 0,
               head.label + ": wide column 16 logits do not depend on the call's width");
+        for (const std::int32_t T : {16, 20, 24, 28, 32}) {
+            const Tensor xw(dx32.p, DType::BF16, {K, T});
+            DeviceArray<float> outw(static_cast<std::size_t>(head.rows) * T);
+            Tensor lw(outw.p, DType::FP32, {head.rows, T});
+            const double screened = time_us([&] {
+                infernix::ops::screened_head_logits(xw, head.bf16_rows ? head.bf16_tensor : Tensor{},
+                                                    head.bf16_rows ? Weight{} : head.q8_weight, head.screen_weight,
+                                                    head.valid, policy, lw, work, nullptr);
+            });
+            std::cout << head.label << " wide T=" << T << ": screened " << screened << " us\n";
+        }
         cudaStream_t stream = nullptr;
         cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "wide stream");
         DeviceArray<float> out(static_cast<std::size_t>(head.rows) * 32);
@@ -702,7 +713,7 @@ void compact_case(const LogitsHead& head, std::uint64_t seed) {
     WorkspaceArena work(bytes);
     const infernix::ops::ScreenedHeadPolicy policy{};
     const auto columns = make_columns(head.values, head.rows, 40, seed, false);
-    for (const std::int32_t T : {1, 2, 4, 8, 12, 16, 24, 40}) {
+    for (const std::int32_t T : {1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 40}) {
         DeviceArray<std::uint16_t> dx(
             std::vector<std::uint16_t>(columns.begin(), columns.begin() + static_cast<std::ptrdiff_t>(K) * T));
         const Tensor x(dx.p, DType::BF16, {K, T});

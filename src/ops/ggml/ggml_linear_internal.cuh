@@ -98,8 +98,8 @@ __device__ __forceinline__ void shfl_add(ggml::I128& r, int offset) {
 
 template <QType F, bool OutF32, int Lanes, int C, bool Tiled = false>
 __global__ void __launch_bounds__(kGgmlThreads)
-    rows_kernel(RowsGroup g, int row_bytes, int slices, const std::int32_t* __restrict__ encoded,
-                const std::int32_t* __restrict__ emax, int columns) {
+    rows_kernel(RowsGroup g, int row_bytes, int slices, const std::int32_t* encoded,
+                const std::int32_t* emax, int columns) {
     constexpr int kRowsPerWarp        = 32 / Lanes;
     constexpr std::size_t kBlockBytes = ggml_block_bytes(F);
     const GroupSlot seg               = group_slot(g);

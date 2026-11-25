@@ -1,10 +1,14 @@
 #include "models/qwen3_5/program/suffix_automaton.h"
 
+#include <algorithm>
+#include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <numeric>
 #include <random>
 #include <vector>
 
+using infernix::models::qwen3_5::detail::DualGenSuffixAutomaton;
 using infernix::models::qwen3_5::detail::SuffixAutomaton;
 
 static void require(bool condition, const char* message) {
@@ -144,6 +148,141 @@ int main() {
         for (int i = 0; i < 300; ++i) { compact_sa.append(1000 + i); }
         require(compact_sa.size() < 2 * 64 || compact_sa.size() <= 1024, "compaction bounded size");
         require(compact_sa.node_count() <= 4 * 1024, "compaction bounded nodes");
+
+        // 15. Cross-request isolation & longest match across separate ingest calls
+        SuffixAutomaton multi_req_sa(256);
+        multi_req_sa.ingest(std::vector<int>{401, 402, 403, 404, 405, 406, 407, 408});
+        multi_req_sa.ingest(std::vector<int>{501, 502, 503, 504, 505, 506, 507, 508});
+        const auto m_r1 = multi_req_sa.propose(std::vector<int>{401, 402, 403, 404, 405, 406}, 8, 6);
+        require(m_r1.matched == 6 && m_r1.tokens == std::vector<int>({407, 408}),
+                "multi-request ingest recovers first request tail and stops at request boundary");
+        const auto m_cross_bleed = multi_req_sa.propose(std::vector<int>{406, 407, 408, 501, 502, 503}, 4, 6);
+        require(m_cross_bleed.tokens.empty(), "ingest boundary prevents cross-request concatenation match");
+
+        // 16. Frequency-weighted continuation beats a single recent outlier, while ties keep recency
+        SuffixAutomaton freq_sa(256);
+        for (int rep = 0; rep < 3; ++rep) {
+            freq_sa.ingest(std::vector<int>{11, 22, 33, 44, 701, 702, 703});
+        }
+        freq_sa.ingest(std::vector<int>{11, 22, 33, 44, 801, 802, 803});
+        const auto freq_match = freq_sa.propose(std::vector<int>{11, 22, 33, 44}, 8, 4);
+        require(freq_match.matched == 4 && freq_match.tokens == std::vector<int>({701, 702, 703}),
+                "frequency-weighted selection prefers 3x pattern over single recent outlier");
+
+        SuffixAutomaton tie_sa(256);
+        tie_sa.ingest(std::vector<int>{51, 52, 53, 54, 901, 902});
+        tie_sa.ingest(std::vector<int>{51, 52, 53, 54, 911, 912});
+        const auto tie_match = tie_sa.propose(std::vector<int>{51, 52, 53, 54}, 8, 4);
+        require(tie_match.matched == 4 && tie_match.tokens == std::vector<int>({911, 912}),
+                "equal-frequency continuations still break ties by recency");
+
+        // 17. 2-branch alt_token / alt_occurrences extraction
+        SuffixAutomaton branch_sa(256);
+        for (int rep = 0; rep < 3; ++rep) {
+            branch_sa.ingest(std::vector<int>{21, 22, 23, 24, 301, 302, 303});
+        }
+        for (int rep = 0; rep < 2; ++rep) {
+            branch_sa.ingest(std::vector<int>{21, 22, 23, 24, 401, 402, 403});
+        }
+        const auto br_match = branch_sa.propose(std::vector<int>{21, 22, 23, 24}, 8, 4);
+        require(br_match.matched == 4 && br_match.tokens == std::vector<int>({301, 302, 303}),
+                "2-branch primary selects 3x pattern");
+        require(br_match.alt_token == 401 && br_match.alt_occurrences == 2,
+                "2-branch alt_token and alt_occurrences expose runner-up continuation");
+
+        // 18. O(1) incremental Cursor matches propose(history) and invalidates on clear()
+        SuffixAutomaton cur_sa(256);
+        cur_sa.ingest(std::vector<int>{60, 61, 62, 63, 64, 65, 66, 67, 68, 69});
+        auto cur = cur_sa.cursor_from(std::span<const int>{});
+        const std::vector<int> stream{999, 60, 61, 62, 63, 64};
+        for (std::size_t idx = 0; idx < stream.size(); ++idx) {
+            cur_sa.advance_cursor(cur, stream[idx]);
+            const std::span<const int> pref(stream.data(), idx + 1);
+            const auto from_cur  = cur_sa.propose_from_cursor(cur, 8, 4);
+            const auto from_hist = cur_sa.propose(pref, 8, 4);
+            require(from_cur.matched == from_hist.matched && from_cur.tokens == from_hist.tokens &&
+                        from_cur.alt_token == from_hist.alt_token &&
+                        from_cur.alt_occurrences == from_hist.alt_occurrences,
+                    "O(1) cursor matches propose(history) bit-for-bit");
+        }
+        const std::uint64_t old_gen = cur.generation;
+        cur_sa.clear();
+        require(cur_sa.generation() > old_gen, "clear() bumps SAM generation");
+        require(cur_sa.propose_from_cursor(cur, 8, 4).tokens.empty(),
+                "stale cursor returns empty after clear()/generation bump");
+
+        // 19. DualGenSuffixAutomaton rotation preserves prior-bank patterns & eliminates rebuild stalls
+        DualGenSuffixAutomaton dg_sa(512); // bank capacity 256 each
+        dg_sa.ingest(std::vector<int>{10, 11, 12, 13, 14, 15, 16, 17});
+        for (int r = 0; r < 10; ++r) { // ~120 tokens -> active bank still, then second batch rotates cleanly
+            std::vector<int> blk(20);
+            std::iota(blk.begin(), blk.end(), 2000 + r * 30);
+            dg_sa.ingest(blk);
+        }
+        // Recent prior-bank pattern survives rotation into standby_
+        std::vector<int> pinned{77, 78, 79, 80, 81, 82, 83, 84, 85, 86};
+        dg_sa.ingest(pinned);
+        const std::uint64_t gen_before = dg_sa.generation();
+        for (int r = 0; r < 10; ++r) { // overflow active_ once so pinned moves into standby_ without double-rotating
+            std::vector<int> fill(16);
+            std::iota(fill.begin(), fill.end(), 5000 + r * 20);
+            dg_sa.ingest(fill);
+        }
+        require(dg_sa.generation() > gen_before, "DualGen rotated cleanly into standby bank");
+        const auto standby_hit = dg_sa.propose(std::vector<int>{77, 78, 79, 80, 81, 82}, 8, 6);
+        require(standby_hit.matched == 6 && standby_hit.tokens == std::vector<int>({83, 84, 85, 86}),
+                "DualGen serves matches from standby bank seamlessly after rotation");
+
+        // Item 3 Benchmark: Single-SAM (compact_if_needed) vs DualGenSuffixAutomaton over 1,000,000 tokens
+        constexpr std::size_t kBenchCap   = 262144;
+        constexpr int kNumReqs            = 2000;
+        constexpr int kReqLen             = 500;
+        std::vector<std::vector<int>> requests(static_cast<std::size_t>(kNumReqs),
+                                               std::vector<int>(static_cast<std::size_t>(kReqLen)));
+        std::mt19937 rng(42);
+        std::vector<int> repeated_template(32);
+        std::iota(repeated_template.begin(), repeated_template.end(), 100);
+        for (int r = 0; r < kNumReqs; ++r) {
+            for (int t = 0; t < kReqLen; ++t) {
+                requests[static_cast<std::size_t>(r)][static_cast<std::size_t>(t)] =
+                    (t < 32) ? repeated_template[static_cast<std::size_t>(t)]
+                             : static_cast<int>(1000 + (rng() % 50000));
+            }
+        }
+
+        const auto bench_ingest = [&](auto& sam, const char* label) {
+            std::vector<double> lat_us;
+            lat_us.reserve(static_cast<std::size_t>(kNumReqs));
+            std::size_t hits = 0;
+            const auto t0    = std::chrono::steady_clock::now();
+            for (int r = 0; r < kNumReqs; ++r) {
+                const auto s0 = std::chrono::steady_clock::now();
+                sam.ingest(requests[static_cast<std::size_t>(r)]);
+                const auto s1 = std::chrono::steady_clock::now();
+                lat_us.push_back(std::chrono::duration<double, std::micro>(s1 - s0).count());
+                if ((r % 20) == 19) {
+                    const auto m = sam.propose(std::span<const int>(repeated_template).first(8), 16, 8);
+                    if (!m.tokens.empty()) { ++hits; }
+                }
+            }
+            const auto t1         = std::chrono::steady_clock::now();
+            const double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::sort(lat_us.begin(), lat_us.end());
+            const double p50_us       = lat_us[lat_us.size() / 2];
+            const double p99_us       = lat_us[(lat_us.size() * 99) / 100];
+            const double max_stall_ms = lat_us.back() / 1000.0;
+            std::cout << std::fixed << std::setprecision(3) << "[SAM Bench] " << label
+                      << ": total_ms=" << total_ms << " p50_us=" << p50_us << " p99_us=" << p99_us
+                      << " max_stall_ms=" << max_stall_ms << " hits=" << hits << '\n';
+            return max_stall_ms;
+        };
+
+        SuffixAutomaton single_sam(kBenchCap, /*compact_enabled=*/true);
+        DualGenSuffixAutomaton dual_sam(kBenchCap);
+        const double single_max_ms = bench_ingest(single_sam, "Single-SAM compact_if_needed");
+        const double dual_max_ms   = bench_ingest(dual_sam, "DualGenSuffixAutomaton");
+        require(dual_max_ms < single_max_ms,
+                "DualGenSuffixAutomaton max ingest stall must be lower than stop-the-world compaction");
 
         std::cout << "All Suffix Automaton unit tests passed successfully!\n";
         return 0;

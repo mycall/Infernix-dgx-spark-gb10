@@ -127,7 +127,7 @@ __global__ void __launch_bounds__(kSparseMoeRouterWarps * 32)
 constexpr int kS2Threads = 128;
 
 template <int Partitions>
-__global__ void sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores,
+__global__ void sparse_moe_small_t_s2_kernel(const float* partial_scores,
                                              int* __restrict__ token_ids,
                                              float* __restrict__ token_alpha,
                                              float* __restrict__ shared_scale) {

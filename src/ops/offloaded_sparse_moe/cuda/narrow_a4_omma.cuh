@@ -90,6 +90,66 @@ __device__ __forceinline__ std::uint32_t omma_pack_scales4(std::uint8_t sw, int 
     return s0 | (s1 << 8) | (s2 << 16) | (s3 << 24);
 }
 
+__device__ __forceinline__ float omma_rcp_nr(float d) {
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(d));
+    return fmaf(r, fmaf(-d, r, 1.0F), r);
+}
+
+__device__ __forceinline__ void omma_quantize_a4_plane_from_f32(const float (&v)[16], float amax, float input_scale,
+                                                                unsigned& low, unsigned& high,
+                                                                std::uint8_t& scale_word) {
+    const float g6           = canon::mul_rn(6.0F, input_scale);
+    const std::uint32_t g6_u = canon::f32_bits(g6) & 0x7FFFFFFFU;
+    float ratio;
+    if (amax == 0.0F) {
+        ratio = 0.0F;
+    } else if (g6_u >= 0x08000000U && g6_u < 0x70000000U) {
+        ratio = canon::mul_rn(amax, omma_rcp_nr(g6));
+    } else {
+        ratio = __fdividef(amax, g6);
+    }
+    scale_word = canon::e4m3_rn_satfinite(ratio);
+    if (canon::e4m3_scaled(scale_word) == 0) {
+        low  = 0U;
+        high = 0U;
+        return;
+    }
+    const float d           = canon::mul_rn(canon::e4m3_value(scale_word), input_scale);
+    const std::uint32_t d_u = canon::f32_bits(d) & 0x7FFFFFFFU;
+    const float inv_d       = (d_u >= 0x08000000U && d_u < 0x70000000U) ? omma_rcp_nr(d) : __fdividef(1.0F, d);
+    float q[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) { q[j] = canon::mul_rn(v[j], inv_d); }
+    asm("{\n\t"
+        ".reg .b8 b0, b1, b2, b3, b4, b5, b6, b7;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, %6, %2;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, %7, %3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b2, %8, %4;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b3, %9, %5;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b4, %14, %10;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b5, %15, %11;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b6, %16, %12;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b7, %17, %13;\n\t"
+        "mov.b32 %0, {b0, b1, b2, b3};\n\t"
+        "mov.b32 %1, {b4, b5, b6, b7};\n\t"
+        "}"
+        : "=r"(low), "=r"(high)
+        : "f"(q[0]), "f"(q[1]), "f"(q[2]), "f"(q[3]), "f"(q[4]), "f"(q[5]), "f"(q[6]), "f"(q[7]),
+          "f"(q[8]), "f"(q[9]), "f"(q[10]), "f"(q[11]), "f"(q[12]), "f"(q[13]), "f"(q[14]), "f"(q[15]));
+}
+
+__device__ __forceinline__ std::uint16_t omma_swiglu_bf16(std::uint16_t gate_bf16, std::uint16_t up_bf16) {
+    const float g     = canon::bf16_to_f32(gate_bf16);
+    const float u     = canon::bf16_to_f32(up_bf16);
+    const float abs_g = fabsf(g);
+    const float e     = __expf(-abs_g);
+    const float denom = 1.0F + e;
+    const float inv   = omma_rcp_nr(denom);
+    const float silu  = (g >= 0.0F ? g : canon::mul_rn(g, e)) * inv;
+    return canon::f32_to_bf16_rn(canon::mul_rn(silu, u));
+}
+
 template <class G>
 __device__ __forceinline__ void omma_quantize_x_chunk(const bf16* x, int token_col, bool live_col, int chunk,
                                                       float input_scale, OmmaXChunk& dst) {
@@ -104,7 +164,7 @@ __device__ __forceinline__ void omma_quantize_x_chunk(const bf16* x, int token_c
         float amax = 0.0F;
         omma_load_x_f32_amax<G>(x, token_col, chunk, b_local, v, amax);
         unsigned low = 0U, high = 0U;
-        canon::quantize_a4_plane_from_f32(v, amax, input_scale, low, high, sw);
+        omma_quantize_a4_plane_from_f32(v, amax, input_scale, low, high, sw);
         const int pos = 4 * k64 + moe::wide::plane_block(b_local & 3);
         *reinterpret_cast<uint2*>(dst.codes[pos][col]) = make_uint2(low, high);
     }
@@ -128,9 +188,9 @@ __device__ __forceinline__ void omma_quantize_x_chunk_split(const bf16* x, int t
         omma_load_x_f32_amax<G>(x, token_col, chunk, b_local, v, amax);
         const int pos = 4 * k64 + moe::wide::plane_block(b_local & 3);
         unsigned low = 0U, high = 0U;
-        canon::quantize_a4_plane_from_f32(v, amax, scale_gate, low, high, sw_g);
+        omma_quantize_a4_plane_from_f32(v, amax, scale_gate, low, high, sw_g);
         *reinterpret_cast<uint2*>(dst_gate.codes[pos][col]) = make_uint2(low, high);
-        canon::quantize_a4_plane_from_f32(v, amax, scale_up, low, high, sw_u);
+        omma_quantize_a4_plane_from_f32(v, amax, scale_up, low, high, sw_u);
         *reinterpret_cast<uint2*>(dst_up.codes[pos][col]) = make_uint2(low, high);
     }
     const std::uint32_t pg = omma_pack_scales4(sw_g, lane);
@@ -172,12 +232,38 @@ struct DownOmmaShared {
     alignas(8) std::uint64_t mbar[2];
 };
 
-template <class G>
+__device__ __forceinline__ void omma_stage_xplane_chunk(const std::uint8_t* x_plane, int first_entry, int n_cols,
+                                                        int chunk, OmmaXChunk& dst) {
+    const int tid = static_cast<int>(threadIdx.x);
+    if (tid < 8 * n_cols) {
+        const int col = tid >> 3;
+        const int v   = tid & 7;
+        const auto* src = reinterpret_cast<const uint4*>(
+            x_plane + static_cast<std::size_t>(first_entry + col) * moe::wide::kXRowBytes + 128 * chunk + 16 * v);
+        const uint4 q                = __ldg(src);
+        dst.codes[2 * v][col][0]     = q.x;
+        dst.codes[2 * v][col][1]     = q.y;
+        dst.codes[2 * v + 1][col][0] = q.z;
+        dst.codes[2 * v + 1][col][1] = q.w;
+    } else if (tid >= 64 && tid < 64 + n_cols) {
+        const int col = tid - 64;
+        const auto* src = reinterpret_cast<const uint4*>(
+            x_plane + static_cast<std::size_t>(first_entry + col) * moe::wide::kXRowBytes +
+            moe::wide::kXCodeBytes + 16 * chunk);
+        const uint4 sc      = __ldg(src);
+        dst.scales4[0][col] = sc.x;
+        dst.scales4[1][col] = sc.y;
+        dst.scales4[2][col] = sc.z;
+        dst.scales4[3][col] = sc.w;
+    }
+}
+
+template <class G, bool UseXPlane = false>
 __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, const bf16* x,
                                                      const MoeDispatch& dispatch, int top_k,
                                                      const std::uint8_t* record, const moe::ExpertScales& scales,
-                                                     int first, int count, int slice, std::uint8_t* h_base,
-                                                     std::uint32_t& phase_bits) {
+                                                     int first, int count, int slice, const std::uint8_t* x_plane,
+                                                     std::uint8_t* h_base, std::uint32_t& phase_bits) {
     using S              = OmmaShape<G>;
     const int tid        = static_cast<int>(threadIdx.x);
     const int warp       = tid >> 5;
@@ -204,25 +290,34 @@ __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, cons
     };
 
     for (int c_base = 0; c_base < count; c_base += 8) {
-        const int n_cols    = min(8, count - c_base);
-        const int col       = tid >> 4;
-        const bool live_col = col < n_cols;
-        const int tok =
-            live_col ? moe::wide::entry_column(dispatch.entries[first + c_base + col], top_k, dispatch.shared_first)
-                     : 0;
+        const int n_cols = min(8, count - c_base);
 
         float acc[4];
         if (!split_in) {
+            int tok       = 0;
+            bool live_col = false;
+            if constexpr (!UseXPlane) {
+                const int col = tid >> 4;
+                live_col      = col < n_cols;
+                tok           = live_col
+                                    ? moe::wide::entry_column(dispatch.entries[first + c_base + col], top_k,
+                                                              dispatch.shared_first)
+                                    : 0;
+            }
 #pragma unroll
             for (int i = 0; i < 4; ++i) { acc[i] = 0.0F; }
             issue_w(0, 0);
-            omma_quantize_x_chunk<G>(x, tok, live_col, 0, scales.input_gate, sm.pipe.x[0]);
+            if constexpr (UseXPlane) {
+                omma_stage_xplane_chunk(x_plane, first + c_base, n_cols, 0, sm.pipe.x[0]);
+            } else {
+                omma_quantize_x_chunk<G>(x, tok, live_col, 0, scales.input_gate, sm.pipe.x[0]);
+            }
             issue_w(1, 1);
             cta_mbarrier_wait(&sm.mbar[0], phase_bits & 1U);
             phase_bits ^= 1U;
             __syncthreads();
 
-#pragma unroll 2
+#pragma unroll 1
             for (int ch = 0; ch < S::kGateUpChunks; ++ch) {
                 const OmmaXChunk& xc = sm.pipe.x[ch & 1];
                 const int b_col      = min(group, n_cols - 1);
@@ -238,7 +333,11 @@ __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, cons
                     mma_nvfp4_e4m3(acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3, b0, b1, sfa, sfb);
                 }
                 if (ch + 1 < S::kGateUpChunks) {
-                    omma_quantize_x_chunk<G>(x, tok, live_col, ch + 1, scales.input_gate, sm.pipe.x[(ch + 1) & 1]);
+                    if constexpr (UseXPlane) {
+                        omma_stage_xplane_chunk(x_plane, first + c_base, n_cols, ch + 1, sm.pipe.x[(ch + 1) & 1]);
+                    } else {
+                        omma_quantize_x_chunk<G>(x, tok, live_col, ch + 1, scales.input_gate, sm.pipe.x[(ch + 1) & 1]);
+                    }
                 }
                 fence_reads_before_async_refill();
                 __syncthreads();
@@ -250,6 +349,12 @@ __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, cons
                 }
             }
         } else {
+            const int col       = tid >> 4;
+            const bool live_col = col < n_cols;
+            const int tok =
+                live_col
+                    ? moe::wide::entry_column(dispatch.entries[first + c_base + col], top_k, dispatch.shared_first)
+                    : 0;
             float acc_g[4] = {0.0F, 0.0F, 0.0F, 0.0F};
             float acc_u[4] = {0.0F, 0.0F, 0.0F, 0.0F};
             issue_w(0, 0);
@@ -260,7 +365,7 @@ __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, cons
             phase_bits ^= 1U;
             __syncthreads();
 
-#pragma unroll 2
+#pragma unroll 1
             for (int ch = 0; ch < S::kGateUpChunks; ++ch) {
                 const int b_col      = min(group, n_cols - 1);
                 const std::uint8_t* wu = sm.pipe.w[ch & 1][rg_local];
@@ -322,12 +427,12 @@ __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, cons
                 const int i_hi = i_lo + 4;
                 const int c0 = 2 * t, c1 = 2 * t + 1;
                 if (c0 < n_cols) {
-                    sm.epi.h[c0][i_lo] = canon::swiglu_bf16(y0, u0);
-                    sm.epi.h[c0][i_hi] = canon::swiglu_bf16(y2, u2);
+                    sm.epi.h[c0][i_lo] = omma_swiglu_bf16(y0, u0);
+                    sm.epi.h[c0][i_hi] = omma_swiglu_bf16(y2, u2);
                 }
                 if (c1 < n_cols) {
-                    sm.epi.h[c1][i_lo] = canon::swiglu_bf16(y1, u1);
-                    sm.epi.h[c1][i_hi] = canon::swiglu_bf16(y3, u3);
+                    sm.epi.h[c1][i_lo] = omma_swiglu_bf16(y1, u1);
+                    sm.epi.h[c1][i_hi] = omma_swiglu_bf16(y3, u3);
                 }
             }
         }
@@ -344,7 +449,7 @@ __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, cons
             }
             unsigned low = 0U, high = 0U;
             std::uint8_t sw = 0U;
-            canon::quantize_a4_plane_from_f32(hv, amax, scales.input_down, low, high, sw);
+            omma_quantize_a4_plane_from_f32(hv, amax, scales.input_down, low, high, sw);
             const int pos       = (slice & ~3) + moe::wide::plane_block(slice & 3);
             std::uint8_t* h_row = h_base + static_cast<std::size_t>(first + c_base + tid) * moe::wide::kHRowStride;
             *reinterpret_cast<uint2*>(h_row + 8 * pos) = make_uint2(low, high);
@@ -447,9 +552,9 @@ __device__ __forceinline__ void down_omma_tile_compute(DownOmmaShared<G>& sm, co
 }
 
 template <class G>
-__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 5)
-    gate_up_omma_kernel(const bf16* __restrict__ x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
-                        const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ flags,
+__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
+    gate_up_omma_kernel(const bf16* x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
+                        const std::uint8_t* const* job_records, const std::int32_t* flags,
                         int base, std::uint8_t* __restrict__ h_base, PassPhase phase) {
     __shared__ GateUpOmmaShared<G> sm;
     if (threadIdx.x == 0) {
@@ -469,7 +574,8 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 5)
             const moe::ExpertScales scales = source.scales[expert];
             const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
             if (count > 0 && !moe::wide_route(count, scales)) {
-                gate_up_omma_slice<G>(sm, x, dispatch, top_k, record, scales, first, count, slice, h_base, mbar_phase);
+                gate_up_omma_slice<G, false>(sm, x, dispatch, top_k, record, scales, first, count, slice, nullptr,
+                                             h_base, mbar_phase);
             }
         }
     }
@@ -477,9 +583,9 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 5)
 }
 
 template <class G>
-__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 5)
-    down_omma_kernel(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* __restrict__ job_records,
-                     const std::int32_t* __restrict__ flags, int base, const std::uint8_t* __restrict__ h_base,
+__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
+    down_omma_kernel(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* job_records,
+                     const std::int32_t* flags, int base, const std::uint8_t* h_base,
                      bf16* __restrict__ outputs, PassPhase phase) {
     using S = OmmaShape<G>;
     __shared__ DownOmmaShared<G> sm;
@@ -532,12 +638,12 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 5)
 }
 
 template <class G>
-__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 5)
-    gate_up_omma_persistent_kernel(const bf16* __restrict__ x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
-                                   const std::uint8_t* const* __restrict__ job_records,
-                                   const std::int32_t* __restrict__ narrow_jobs,
-                                   const std::int32_t* __restrict__ pass_narrow, int pass_index,
-                                   std::uint8_t* __restrict__ h_base) {
+__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
+    gate_up_omma_persistent_kernel(const bf16* x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
+                                   const std::uint8_t* const* job_records,
+                                   const std::int32_t* narrow_jobs,
+                                   const std::int32_t* pass_narrow, int pass_index,
+                                   const std::uint8_t* x_plane, std::uint8_t* __restrict__ h_base) {
     using S = OmmaShape<G>;
     __shared__ GateUpOmmaShared<G> sm;
     if (threadIdx.x == 0) {
@@ -560,7 +666,8 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 5)
         const moe::ExpertScales scales = source.scales[expert];
         const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
         if (count <= 0 || moe::wide_route(count, scales)) { continue; }
-        gate_up_omma_slice<G>(sm, x, dispatch, top_k, record, scales, first, count, slice, h_base, mbar_phase);
+        gate_up_omma_slice<G, true>(sm, x, dispatch, top_k, record, scales, first, count, slice, x_plane, h_base,
+                                    mbar_phase);
         fence_reads_before_async_refill();
         __syncthreads();
     }
@@ -568,12 +675,12 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 5)
 }
 
 template <class G>
-__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 5)
+__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
     down_omma_persistent_kernel(MoeDispatch dispatch, MoeExpertSource source,
-                                const std::uint8_t* const* __restrict__ job_records,
-                                const std::int32_t* __restrict__ narrow_jobs,
-                                const std::int32_t* __restrict__ pass_narrow, int pass_index,
-                                const std::uint8_t* __restrict__ h_base, bf16* __restrict__ outputs) {
+                                const std::uint8_t* const* job_records,
+                                const std::int32_t* narrow_jobs,
+                                const std::int32_t* pass_narrow, int pass_index,
+                                const std::uint8_t* h_base, bf16* __restrict__ outputs) {
     using S = OmmaShape<G>;
     __shared__ DownOmmaShared<G> sm;
     if (threadIdx.x == 0) {
@@ -648,7 +755,7 @@ int persistent_omma_ctas() {
         int dev = 0, sms = 0;
         CUDA_CHECK(cudaGetDevice(&dev));
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-        return sms * 5;
+        return sms * 7;
     }();
     return ctas;
 }
@@ -667,7 +774,7 @@ void launch_expert_pass_a4_omma(const bf16* x, const MoeDispatch& dispatch, cons
             CUDA_CHECK(pdl::launch_with(unstaged_direct ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized,
                                         {dim3(persistent), dim3(S::kThreads), 0, stream},
                                         gate_up_omma_persistent_kernel<G>, x, dispatch, source, top_k, job_records,
-                                        layout.narrow_jobs, layout.pass_narrow, pass_index, h_base));
+                                        layout.narrow_jobs, layout.pass_narrow, pass_index, layout.x_plane, h_base));
             check_launch("A4 OMMA gate/up xplane");
         }
         if (part == PassPart::GateUp) { return; }

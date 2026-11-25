@@ -56,7 +56,7 @@ __device__ __forceinline__ void q8_simt_issue_stage(uint4* __restrict__ shared_c
 
 template <class Schedule, bool FullStage, bool FullCols>
 __device__ __forceinline__ void
-q8_simt_consume_stage(const __nv_bfloat16* __restrict__ x, std::int32_t k, int col0,
+q8_simt_consume_stage(const __nv_bfloat16* x, std::int32_t k, int col0,
                       int active_cols, int stage, int active_groups,
                       const uint4* __restrict__ shared_codes,
                       const std::uint32_t* __restrict__ shared_scales, int lane,
@@ -109,7 +109,7 @@ q8_simt_consume_stage(const __nv_bfloat16* __restrict__ x, std::int32_t k, int c
 template <class Schedule, bool Full, bool FullK, class Output, class Epilogue,
           bool TriggerPdl = false, bool JoinPdl = false>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_a16_simt_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const __nv_bfloat16* x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue, int rows, int k,
     int tokens, int padded_k, int token_begin) {
     if constexpr (TriggerPdl) {

@@ -13,7 +13,7 @@ template <class Schedule, bool FullK, bool FullTokens, class Output, class Epilo
           bool TriggerPdl = false, bool JoinPdl = false>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_direct_simt_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const __nv_bfloat16* x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales, Output output,
     Epilogue epilogue, int rows, int k, int tokens, int padded_k, int token_begin) {
     constexpr int R  = Schedule::kBlockRows;

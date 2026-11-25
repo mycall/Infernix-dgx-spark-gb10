@@ -45,7 +45,8 @@ struct ForwardFastPaths {
     bool a8_experts_wide = false;
 };
 
-// router-mma's narrowest call: prefill chunks and walk calls, never decode or verification rounds.
-inline constexpr std::int32_t kRouterMmaMinColumns = 256;
+// router-mma's narrowest call: c=4 decode/verification (T >= 9) and prefill/walk chunks;
+// T = 1..8 (c=1 and narrow single-row) stay on projection_kernel.
+inline constexpr std::int32_t kRouterMmaMinColumns = 9;
 
 } // namespace infernix::models::qwen4_exp::execution

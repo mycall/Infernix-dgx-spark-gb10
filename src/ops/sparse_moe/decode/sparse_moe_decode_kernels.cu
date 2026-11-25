@@ -35,7 +35,7 @@ constexpr int kAdaptiveD3Blocks = 16 * 48;
 constexpr int kAdaptiveD4Blocks = 16 * 48;
 static_assert(kSparseMoeRouterHidden == kHidden);
 
-__global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
+__global__ void sparse_moe_d1_kernel(const __nv_bfloat16* x,
                                      const __nv_bfloat16* __restrict__ router,
                                      float* __restrict__ scores,
                                      const char* __restrict__ shared_down_codes,
@@ -230,7 +230,7 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
 
 template <class RoutedCodec>
 __global__ void sparse_moe_d3_nine_warp_kernel(
-    const __nv_bfloat16* __restrict__ x, const int* __restrict__ ids,
+    const __nv_bfloat16* x, const int* ids,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
     const std::uint8_t* __restrict__ shared_scales, float* __restrict__ act) {
@@ -261,11 +261,11 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
 
 template <class RoutedCodec, int PathsPerBlock, bool Adaptive, int RoutedDepth>
 __global__ void sparse_moe_d3_path_tiled_kernel(
-    const __nv_bfloat16* __restrict__ x, const int* __restrict__ token_ids,
+    const __nv_bfloat16* x, const int* token_ids,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
     const std::uint8_t* __restrict__ shared_scales, float* __restrict__ token_activations,
-    int tokens, const int* __restrict__ adaptive_route_jobs) {
+    int tokens, const int* adaptive_route_jobs) {
     // Three path CTAs per token/output row expose enough blocks for the whole grid and keep the
     // heavier shared Q8 path from holding eight completed routed warps resident.
     static_assert(PathsPerBlock > 0 && (kTopK + 1) % PathsPerBlock == 0);
@@ -377,8 +377,8 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
 
 template <class RoutedCodec, int Rows>
 __global__ void sparse_moe_d4_nine_warp_kernel(
-    const int* __restrict__ ids, const float* __restrict__ alpha,
-    const float* __restrict__ shared_scale, const float* __restrict__ act,
+    const int* ids, const float* alpha,
+    const float* shared_scale, const float* act,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
     const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination,
@@ -430,12 +430,12 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
 
 template <class RoutedCodec, int Rows, bool Adaptive>
 __global__ void sparse_moe_d4_token_kernel(
-    const int* __restrict__ token_ids, const float* __restrict__ token_alpha,
-    const float* __restrict__ shared_scale, const float* __restrict__ token_activations,
+    const int* token_ids, const float* token_alpha,
+    const float* shared_scale, const float* token_activations,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
     const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination,
-    int tokens, const int* __restrict__ adaptive_route_jobs, const char* __restrict__ prefetch_data,
+    int tokens, const int* adaptive_route_jobs, const char* __restrict__ prefetch_data,
     unsigned long long prefetch_bytes) {
     // Token is a grid dimension rather than an in-CTA serial loop. Rows lets one routed-weight
     // stream serve adjacent outputs while retaining the deterministic rank-order FP32 epilogue.

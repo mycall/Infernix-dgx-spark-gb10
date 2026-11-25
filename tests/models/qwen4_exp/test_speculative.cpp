@@ -8,6 +8,7 @@
 // the kept count stopping at the cut is itself a regression guard.
 
 #include "models/qwen4_exp/program/mtp_gating.h"
+#include "models/qwen3_5/program/ngram_proposer.h"
 
 #include <algorithm>
 #include <array>
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
+#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -319,7 +321,12 @@ void check_ngram_buckets_and_moe_copy_stitch() {
     using infernix::models::qwen4_exp::ngram_confidence_bucket;
 
     require(ngram_confidence_bucket(0, 5, 10, false) == 0, "bucket 0 for matched 0");
-    require(ngram_confidence_bucket(7, 5, 10, false) == 0, "bucket 0 for matched 7");
+    require(ngram_confidence_bucket(3, 5, 10, false) == 0, "bucket 0 for matched 3");
+    require(ngram_confidence_bucket(5, 2, 10, false) == 0, "bucket 0 for matched 5 low occ");
+    require(ngram_confidence_bucket(7, 2, 10, false) == 0, "bucket 0 for matched 7 low occ");
+    require(ngram_confidence_bucket(5, 3, 10, false) == 1, "bucket 1 for matched 5 occ 3");
+    require(ngram_confidence_bucket(7, 5, 10, false) == 1, "bucket 1 for matched 7 occ 5");
+    require(ngram_confidence_bucket(6, 6, 10, false) == 2, "bucket 2 for matched 6 occ 6");
     require(ngram_confidence_bucket(8, 1, 4096, false) == 1, "bucket 1 for 8..11 single stale");
     require(ngram_confidence_bucket(11, 1, 2049, false) == 1, "bucket 1 just outside recency window");
     require(ngram_confidence_bucket(8, 2, 10000, false) == 2, "bucket 2 for 8..11 repeated");
@@ -639,6 +646,185 @@ void check_concurrent_staged_width_bucketing() {
             "post-draft stitching resets row > 0 columns when W > staged_width");
 }
 
+void check_dcut_batch_pruning() {
+    using infernix::models::qwen4_exp::calibrate_dcut_rate;
+    using infernix::models::qwen4_exp::choose_dcut_batch_cap;
+    using infernix::models::qwen4_exp::kMtpSampledCumulativeBins;
+    using infernix::models::qwen4_exp::select_ngram_proposal;
+
+    const auto multirow_cost = [](std::int32_t w) noexcept {
+        return w <= 0 ? 1.0 : (1.0 + 0.05 * static_cast<double>(w));
+    };
+
+    // 1. batch == 1 must never prune below its single-row extent.
+    {
+        const std::array<std::int32_t, 1> ext{5};
+        const std::array<std::array<double, 8>, 1> rates{{{{0.40, 0.35, 0.30, 0.25, 0.20, 0.0, 0.0, 0.0}}}};
+        require(choose_dcut_batch_cap(1, ext, rates, multirow_cost) == 5,
+                "D-Cut leaves batch=1 single-row extent unchanged");
+    }
+
+    // 2. Homogeneous high-confidence batch=4 keeps full extent 5.
+    {
+        const std::array<std::int32_t, 4> ext{5, 5, 5, 5};
+        const std::array<double, 8> high{0.96, 0.96, 0.96, 0.96, 0.96, 0.0, 0.0, 0.0};
+        const std::array<std::array<double, 8>, 4> rates{high, high, high, high};
+        require(choose_dcut_batch_cap(4, ext, rates, multirow_cost) == 5,
+                "D-Cut retains full width for homogeneous high-confidence batch=4");
+    }
+
+    // 3. Heterogeneous batch=4: one long lukewarm outlier (extent 5) while 3 rows stopped at 1
+    // gets pruned so verification width does not balloon for a single low-yield tail.
+    {
+        const std::array<std::int32_t, 4> ext{5, 1, 1, 1};
+        const std::array<std::array<double, 8>, 4> rates{{
+            {0.66, 0.59, 0.51, 0.43, 0.32, 0.0, 0.0, 0.0},
+            {0.51, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+            {0.51, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+            {0.51, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+        }};
+        const std::int32_t cap = choose_dcut_batch_cap(4, ext, rates, multirow_cost);
+        require(cap >= 1 && cap < 3, "D-Cut prunes lukewarm outlier tail on heterogeneous batch=4");
+    }
+
+    // 4. All low-confidence neural rows: if zero marginal gain clears cost, prune down cleanly.
+    {
+        const std::array<std::int32_t, 4> ext{3, 3, 2, 2};
+        const std::array<double, 8> poor{0.10, 0.10, 0.10, 0.0, 0.0, 0.0, 0.0, 0.0};
+        const std::array<std::array<double, 8>, 4> rates{poor, poor, poor, poor};
+        require(choose_dcut_batch_cap(4, ext, rates, multirow_cost) <= 1,
+                "D-Cut prunes low-survival batch=4 chain");
+    }
+
+    // 5. Mixed copy+neural batch: an n-gram copy row already paying width=12 makes verification
+    // up to 12 columns free for neural rows, so neural drafts up to 5 are not trimmed.
+    {
+        const std::array<std::int32_t, 4> ext{5, 1, 0, 0}; // row 2 & 3 are n-gram copy rows (0 in dcut_extents)
+        const std::array<std::array<double, 8>, 4> rates{{
+            {0.51, 0.51, 0.43, 0.32, 0.26, 0.0, 0.0, 0.0},
+            {0.51, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+            {0.0},
+            {0.0},
+        }};
+        const auto copy_cost_fn = [](std::int32_t w) noexcept {
+            const std::int32_t vw = std::max(12, w);
+            return 1.0 + 0.05 * static_cast<double>(vw);
+        };
+        require(choose_dcut_batch_cap(4, ext, rates, copy_cost_fn) == 5,
+                "D-Cut does not trim neural drafts when an n-gram copy already sets wider batch width");
+    }
+
+    // 6. Greedy invariance: sampled observed/expected scaling and EMA blending do not alter greedy rates.
+    {
+        require(std::abs(calibrate_dcut_rate(0.84F, 1.0, 5.0, 0.20, false) - static_cast<double>(0.84F)) < 1e-12,
+                "calibrate_dcut_rate leaves greedy rate unchanged regardless of sampled history");
+    }
+
+    // 7. Sampled online calibration triggers pruning where optimistic raw bin priors do not.
+    {
+        const std::array<std::int32_t, 4> ext{5, 5, 5, 5};
+        const std::array<float, 5> raw_bins{
+            kMtpSampledCumulativeBins.rates[6], // 0.91
+            kMtpSampledCumulativeBins.rates[5], // 0.84
+            kMtpSampledCumulativeBins.rates[5], // 0.84
+            kMtpSampledCumulativeBins.rates[4], // 0.76
+            kMtpSampledCumulativeBins.rates[4], // 0.76
+        };
+        std::array<std::array<double, 8>, 4> raw_rates{};
+        std::array<std::array<double, 8>, 4> cal_rates{};
+        const double observed = 2.2, expected = 5.0;
+        const std::array<double, 5> ema{0.70, 0.50, 0.35, 0.25, 0.20};
+        for (std::int32_t b = 0; b < 4; ++b) {
+            for (std::int32_t j = 0; j < ext[b]; ++j) {
+                raw_rates[b][static_cast<std::size_t>(j)] = static_cast<double>(raw_bins[static_cast<std::size_t>(j)]);
+                cal_rates[b][static_cast<std::size_t>(j)] =
+                    calibrate_dcut_rate(raw_bins[static_cast<std::size_t>(j)], observed, expected,
+                                        ema[static_cast<std::size_t>(j)], true);
+            }
+        }
+        const std::int32_t raw_cap = choose_dcut_batch_cap(4, ext, raw_rates, multirow_cost);
+        const std::int32_t cal_cap = choose_dcut_batch_cap(4, ext, cal_rates, multirow_cost);
+        require(raw_cap == 5, "raw sampled bin priors over-predict survival and fail to prune tail");
+        require(cal_cap < 5, "online-calibrated sampled rates trigger D-Cut pruning on low-survival tail");
+    }
+
+    // 8. DFlash2-style calibrated survival pruning with piecewise cost and n-gram floor.
+    {
+        const std::array<std::int32_t, 4> ext{6, 6, 3, 2};
+        const std::array<std::array<double, 8>, 4> df_rates{{
+            {0.85, 0.65, 0.50, 0.35, 0.25, 0.15, 0.0, 0.0},
+            {0.80, 0.60, 0.45, 0.30, 0.20, 0.10, 0.0, 0.0},
+            {0.75, 0.55, 0.40, 0.0, 0.0, 0.0, 0.0, 0.0},
+            {0.70, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+        }};
+        const auto df_cost_none = [](std::int32_t w) noexcept {
+            const double vc = w <= 0 ? 1.0 : (w <= 3 ? 1.0 + 0.05 * w : 1.15 + 0.05 * (w - 3));
+            return vc + 0.08;
+        };
+        const std::int32_t pruned = choose_dcut_batch_cap(4, ext, df_rates, df_cost_none);
+        require(pruned >= 2 && pruned < 6,
+                "DFlash2-style calibrated rates prune low-yield trailing steps across batch=4");
+
+        // When an n-gram copy sets width floor=4, cost is flat up to w=4 so cap >= 4.
+        const auto df_cost_ngram4 = [](std::int32_t w) noexcept {
+            const std::int32_t vw = std::max(4, w);
+            return 1.0 + (vw <= 3 ? 0.05 * vw : 0.15 + 0.05 * (vw - 3)) + 0.08;
+        };
+        const std::array<std::int32_t, 4> ext_with_copy{6, 3, 0, 2};
+        require(choose_dcut_batch_cap(4, ext_with_copy, df_rates, df_cost_ngram4) >= 4,
+                "DFlash2-style D-Cut honors n-gram copy floor in batch round cost");
+    }
+}
+
+void check_cross_request_suffix_proposal() {
+    using infernix::models::qwen3_5::NgramMatch;
+    using infernix::models::qwen3_5::detail::NgramProposer;
+    using infernix::models::qwen4_exp::select_ngram_proposal;
+
+    NgramProposer cross(256, 128);
+    cross.set_boundaries({999});
+
+    // Request 1 & 2 outputs ingested separately with boundary isolation.
+    std::vector<std::int32_t> req1{10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+    std::vector<std::int32_t> req2{200, 201, 202, 203, 204, 205, 999, 300, 301};
+    cross.ingest(req1);
+    cross.ingest(req2);
+
+    // Cold request (empty in-request proposer) matches prior Request 1 via cross_request_proposer.
+    NgramProposer cold_req(128, 64);
+    const std::vector<std::int32_t> prompt_tail{10, 20, 30, 40, 50, 60};
+    const auto local_miss = cold_req.propose(prompt_tail, 8, 6);
+    require(local_miss.tokens.empty(), "cold request has no in-request match");
+    const auto cross_hit = cross.propose(prompt_tail, 8, 6);
+    const auto picked    = select_ngram_proposal(local_miss, cross_hit);
+    require(picked.matched == 6 && picked.tokens == std::vector<std::int32_t>({70, 80, 90, 100}),
+            "cross-request proposer rescues cold request without crossing boundaries");
+
+    // Request 2 boundary token 999 prevents leaking across request/turn boundaries.
+    const auto bleed_check = cross.propose(std::vector<std::int32_t>{200, 201, 202, 203, 204, 205}, 8, 6);
+    require(bleed_check.tokens.empty(), "match never crosses boundary token or unrelated request tail");
+
+    // In-request match takes precedence over equal or shorter cross-request match.
+    NgramMatch local_strong{.tokens = {1, 2, 3}, .matched = 8};
+    NgramMatch cross_shorter{.tokens = {4, 5, 6, 7}, .matched = 6};
+    const auto prefer_local = select_ngram_proposal(local_strong, cross_shorter);
+    require(prefer_local.matched == 8 && prefer_local.tokens == std::vector<std::int32_t>({1, 2, 3}),
+            "longer in-request match overrides shorter cross-request match");
+
+    // Compaction stress: ingest > 3x capacity (256) requests, newest pattern remains intact.
+    for (int r = 0; r < 24; ++r) {
+        std::vector<std::int32_t> fill(40);
+        std::iota(fill.begin(), fill.end(), 1000 + r * 50);
+        cross.ingest(fill);
+    }
+    const std::vector<std::int32_t> recent{2150, 2151, 2152, 2153, 2154, 2155, 2156, 2157, 2158, 2159};
+    cross.ingest(recent);
+    const auto post_compact = cross.propose(std::vector<std::int32_t>{2150, 2151, 2152, 2153, 2154, 2155}, 8, 6);
+    require(post_compact.matched == 6 &&
+                post_compact.tokens == std::vector<std::int32_t>({2156, 2157, 2158, 2159}),
+            "cross-request proposer remains accurate after sliding window compaction");
+}
+
 } // namespace
 
 int main() {
@@ -655,6 +841,8 @@ int main() {
         check_ngram_buckets_and_moe_copy_stitch();
         check_root_fork_trees();
         check_concurrent_staged_width_bucketing();
+        check_dcut_batch_pruning();
+        check_cross_request_suffix_proposal();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

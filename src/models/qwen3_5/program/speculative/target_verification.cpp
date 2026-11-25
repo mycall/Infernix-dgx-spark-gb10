@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/execution_context.h"
+#include "infernix/ops/sampling.h"
 #include "infernix/ops/scatter.h"
 #include "infernix/ops/speculative_round.h"
 #include "infernix/ops/speculative_tree.h"
@@ -77,22 +78,28 @@ void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store, 
             ops::speculative_tree_compact_columns(features, features.ne[2], frame.active_lanes,
                                                   frame.accepted_path, frame.accepted_drafts, stream);
         }
-    } else if (frame.proposal_q.data != nullptr) {
-        ops::speculative_accept_sparse_drafts(
-            frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
-            frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,
-            frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
-            dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
-            {.all_rows_greedy_without_penalties = false,
-             .block_verification                = execution.execution_schedule.block_verification},
-            execution.work, execution.device.stream);
     } else {
-        ops::speculative_accept_greedy_drafts(
-            frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
-            frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
-            frame.accepted_drafts,
-            dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
-            execution.work, execution.device.stream);
+        ops::filter_combined_branch_masks(
+            frame.target_logits,
+            dimension(execution.parameters.model.resources().public_token_count),
+            frame.sampling, execution.device.stream, frame.drafts, frame.current_extents);
+        if (frame.proposal_q.data != nullptr) {
+            ops::speculative_accept_sparse_drafts(
+                frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
+                frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,
+                frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
+                dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
+                {.all_rows_greedy_without_penalties = false,
+                 .block_verification                = execution.execution_schedule.block_verification},
+                execution.work, execution.device.stream);
+        } else {
+            ops::speculative_accept_greedy_drafts(
+                frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
+                frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
+                frame.accepted_drafts,
+                dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
+                execution.work, execution.device.stream);
+        }
     }
     ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
                                             frame.selected_hidden, execution.device.stream);

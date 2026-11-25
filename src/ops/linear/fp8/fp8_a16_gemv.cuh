@@ -103,7 +103,7 @@ __device__ __forceinline__ void accumulate_rows(const Fp8CodePack<Values> (&code
 template <class Schedule, class Output, class Epilogue, class RowPolicy, class Scale = __nv_bfloat16>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_gemv_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ weight_codes,
+    const __nv_bfloat16* x, const std::uint8_t* __restrict__ weight_codes,
     const Scale* __restrict__ row_scales, Output output, Epilogue epilogue,
     RowPolicy row_policy, int rows, int input_rows) {
     constexpr bool PairRows       = RowPolicy::kPaired;

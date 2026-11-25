@@ -164,6 +164,23 @@ void speculative_accept_sparse_tree(const Tensor& target_tokens, const Tensor& l
                                     WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
+ * Op: speculative_accept_compact_sparse_tree
+ *
+ * Compact top-k candidate form of speculative_accept_sparse_tree for screened LM heads: reads the
+ * screened compact candidate table [cap, W, B] / [W, B] directly without materializing full
+ * [248320, W, B] logits or transient sampling workspace. Outputs and semantics match
+ * speculative_accept_sparse_tree bit for bit for any support fitting within compact_ids.
+ */
+void speculative_accept_compact_sparse_tree(
+    const Tensor& compact_ids, const Tensor& compact_logits, const Tensor& compact_counts,
+    const Tensor& drafts, const Tensor& candidate_ids, const Tensor& proposal_q,
+    const Tensor& current_extents, const Tensor& tree_rows, Tensor& round_lengths,
+    Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted_drafts, Tensor& accepted_path, Tensor& accepted_branch,
+    std::int32_t token_domain, const SamplingConfig* configs, cudaStream_t stream,
+    const SpeculativeAcceptExecutionEnvelope& execution = {});
+
+/**
  * Op: speculative_tree_compact_columns
  *
  * data is an in-place [inner, D, outer...] tensor (D >= W columns) whose outer extent is

@@ -23,7 +23,7 @@ __device__ __forceinline__ std::int64_t bf16_sliced_k_weight_row(const Output& o
 
 template <class Schedule, class Output, class Epilogue>
 __device__ __forceinline__ void
-bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
+bf16_a16_sliced_k_mma_body(const __nv_bfloat16* x,
                            const __nv_bfloat16* __restrict__ weight, Output output,
                            Epilogue epilogue, int rows, int input_rows, int tokens, int row_tile,
                            int token0, unsigned char* shared_raw) {
@@ -276,7 +276,7 @@ __global__ __launch_bounds__(
     Schedule::kThreads,
     gb10_bf16_clamp_min_blocks(Schedule::kMinBlocksPerSm,
                                bf16_mma_shared_bytes<Schedule, Epilogue>)) void
-bf16_a16_sliced_k_mma_kernel(const __nv_bfloat16* __restrict__ x,
+bf16_a16_sliced_k_mma_kernel(const __nv_bfloat16* x,
                              const __nv_bfloat16* __restrict__ weight, Output output,
                              Epilogue epilogue, int rows, int input_rows, int tokens,
                              int token_offset, int count) {

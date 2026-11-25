@@ -151,7 +151,7 @@ __device__ __forceinline__ void load_nvfp4_coefficients(
 
 template <class Geometry, class Schedule>
 __device__ __forceinline__ void
-compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+compute_nvfp4_rows(const __nv_bfloat16* x, const std::uint8_t* __restrict__ codes,
                    const std::uint8_t* __restrict__ scales,
                    const Nvfp4A16GemvSharedStorage<Geometry, Schedule>& shared,
                    float inverse_weight_divisor, const int (&parent_rows)[Schedule::kRowsPerWarp],
@@ -250,7 +250,7 @@ nvfp4_stage_a16_scales(const std::uint8_t* scales,
 template <class Schedule, class Output, class Epilogue, class Rows>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_gemv_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const __nv_bfloat16* x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, float alpha, Output output, Epilogue epilogue,
     Rows policy, int rows) {
     using Geometry = Nvfp4Geometry<128, Schedule::kStaticK>;

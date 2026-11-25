@@ -12,7 +12,7 @@ namespace infernix::ops::detail {
 template <class Schedule, bool WideScales, class Output, class Epilogue, bool TriggerPdl = false,
           bool JoinPdl = false>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_gemv_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const __nv_bfloat16* x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales, Output output,
     Epilogue epilogue, int rows, int k, int padded_k) {
     constexpr int R  = Schedule::kBlockRows;

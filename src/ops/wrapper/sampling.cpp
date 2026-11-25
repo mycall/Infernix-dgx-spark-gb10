@@ -1,5 +1,6 @@
 // infernix::ops - sample wrapper: public api validation and dispatch.
 #include "infernix/ops/sampling.h"
+#include "infernix/ops/speculative_tree.h"
 
 #include "ops/common/sampling_workspace.h"
 #include "ops/launcher/sampling.h" // detail::sample_batch_launch
@@ -111,6 +112,66 @@ void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaS
             "increment_token_counts: token_counts must be a contiguous non-empty I32 vector");
     }
     detail::increment_token_counts_launch(token_ids, token_counts, stream);
+}
+
+void filter_combined_branch_masks(const Tensor& logits, std::int32_t token_domain,
+                                  const SamplingConfig* configs, cudaStream_t stream,
+                                  const Tensor& drafts, const Tensor& current_extents,
+                                  const Tensor& tree_rows) {
+    if (logits.dtype != DType::BF16 && logits.dtype != DType::FP32) {
+        throw std::invalid_argument("filter_combined_branch_masks: logits must be BF16 or FP32");
+    }
+    if (!logits.is_contiguous() || logits.data == nullptr) {
+        throw std::invalid_argument(
+            "filter_combined_branch_masks: logits must be contiguous and non-null");
+    }
+    const bool has_drafts = drafts.data != nullptr;
+    if (has_drafts) {
+        if (drafts.dtype != DType::I32 || !drafts.is_contiguous() || drafts.ne[0] <= 0 ||
+            drafts.ne[1] <= 0 || drafts.ne[2] != 1 || drafts.ne[3] != 1) {
+            throw std::invalid_argument(
+                "filter_combined_branch_masks: drafts must be contiguous I32 [K,B]");
+        }
+        const std::int32_t cols  = drafts.ne[0] + 1;
+        const std::int32_t batch = drafts.ne[1];
+        if (logits.ne[0] <= 0 || logits.ne[1] != cols || logits.ne[2] != batch ||
+            logits.ne[3] != 1) {
+            throw std::invalid_argument(
+                "filter_combined_branch_masks: logits must be [physical_rows,K+1,B]");
+        }
+        if (current_extents.dtype != DType::I32 || !current_extents.is_contiguous() ||
+            current_extents.data == nullptr || current_extents.ne[0] != batch ||
+            current_extents.ne[1] != 1 || current_extents.ne[2] != 1 ||
+            current_extents.ne[3] != 1) {
+            throw std::invalid_argument(
+                "filter_combined_branch_masks: current_extents must be contiguous I32 [B]");
+        }
+        if (tree_rows.data != nullptr &&
+            (tree_rows.dtype != DType::I32 || !tree_rows.is_contiguous() ||
+             tree_rows.ne[0] != kSpeculativeTreeRowWords || tree_rows.ne[1] != batch ||
+             tree_rows.ne[2] != 1 || tree_rows.ne[3] != 1)) {
+            throw std::invalid_argument(
+                "filter_combined_branch_masks: tree_rows must be contiguous I32 [words,B]");
+        }
+    } else {
+        if (current_extents.data != nullptr || tree_rows.data != nullptr) {
+            throw std::invalid_argument(
+                "filter_combined_branch_masks: extents and tree_rows require drafts");
+        }
+        if (logits.ne[0] <= 0 || logits.ne[1] <= 0 || logits.ne[2] != 1 || logits.ne[3] != 1) {
+            throw std::invalid_argument(
+                "filter_combined_branch_masks: logits must be [physical_rows,B]");
+        }
+    }
+    if (token_domain <= 0 || token_domain > logits.ne[0]) {
+        throw std::invalid_argument(
+            "filter_combined_branch_masks: token_domain exceeds logits rows");
+    }
+    if (configs == nullptr) {
+        throw std::invalid_argument("filter_combined_branch_masks: configs must be non-null");
+    }
+    detail::filter_combined_branch_masks_launch(logits, token_domain, configs, stream, drafts,
+                                                current_extents, tree_rows);
 }
 
 } // namespace infernix::ops

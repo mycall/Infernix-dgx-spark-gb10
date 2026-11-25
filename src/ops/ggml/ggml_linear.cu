@@ -138,7 +138,7 @@ __device__ int encode_column_vec(const std::uint16_t* __restrict__ v, int k, con
 }
 
 __global__ void __launch_bounds__(kEncodeThreads)
-    encode_kernel(const std::uint16_t* __restrict__ x, int k, const std::int32_t* __restrict__ perm, int perm_block,
+    encode_kernel(const std::uint16_t* x, int k, const std::int32_t* __restrict__ perm, int perm_block,
                   std::int32_t* __restrict__ encoded, std::int32_t* __restrict__ emax, int vec) {
     __shared__ unsigned warp_key[kEncodeThreads / 32];
     __shared__ int broadcast;
@@ -163,7 +163,7 @@ enum : int { kPlain = 0, kStaged = 1 };
 
 template <QType F, bool OutF32, int Stage>
 __device__ __forceinline__ void mma_rows_body(const GroupSlot& seg, int row_bytes, int slices,
-                                              const std::int32_t* __restrict__ encoded, const std::int32_t* __restrict__ emax,
+                                              const std::int32_t* encoded, const std::int32_t* emax,
                                               int columns, MmaPartial& partial,
                                               ggml::mma_rows::StagedRows<F>* staged = nullptr) {
     constexpr int Warps        = kMmaWarps;
@@ -229,8 +229,8 @@ template <QType F, bool OutF32, int Stage = kStaged>
 __global__ void __launch_bounds__(
     kMmaWarps * 32,
     mma_rows_min_blocks(Stage == kStaged ? sizeof(ggml::mma_rows::StagedRows<F>) * kMmaWarps : 0))
-    mma_rows_kernel(RowsGroup grp, int row_bytes, int slices, const std::int32_t* __restrict__ encoded,
-                    const std::int32_t* __restrict__ emax, int columns) {
+    mma_rows_kernel(RowsGroup grp, int row_bytes, int slices, const std::int32_t* encoded,
+                    const std::int32_t* emax, int columns) {
     __shared__ MmaPartial partial;
     __shared__ ggml::mma_rows::StagedRows<F> staged[kMmaWarps];
     mma_rows_body<F, OutF32, Stage>(group_slot(grp), row_bytes, slices, encoded, emax, columns, partial, staged);
@@ -242,8 +242,8 @@ __global__ void __launch_bounds__(
     mma_rows_min_blocks(std::max(sizeof(ggml::mma_rows::StagedRows<F0>),
                                  sizeof(ggml::mma_rows::StagedRows<F1>)) *
                         kMmaWarps))
-    mma_rows_mixed_kernel(RowsGroup grp, int slices, const std::int32_t* __restrict__ encoded,
-                          const std::int32_t* __restrict__ emax, int columns) {
+    mma_rows_mixed_kernel(RowsGroup grp, int slices, const std::int32_t* encoded,
+                          const std::int32_t* emax, int columns) {
     __shared__ MmaPartial partial;
     __shared__ union {
         ggml::mma_rows::StagedRows<F0> s0[kMmaWarps];
@@ -401,7 +401,7 @@ void launch_narrow(QType format, GgmlLayout layout, const RowsGroup& g, int k, c
 // Column c's sum of x over each 32-element slice (input element j at x[perm(j)]), in element order:
 // the K-quants' min term for the BF16 tiles. One CTA per column.
 __global__ void __launch_bounds__(128)
-    bf16_xsum_kernel(const std::uint16_t* __restrict__ x, int k, const std::int32_t* __restrict__ perm,
+    bf16_xsum_kernel(const std::uint16_t* x, int k, const std::int32_t* __restrict__ perm,
                      int perm_block, float* __restrict__ xsum) {
     const int c = static_cast<int>(blockIdx.x), slices = k / 32;
     const std::uint16_t* column = x + static_cast<std::size_t>(c) * k;

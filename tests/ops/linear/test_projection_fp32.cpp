@@ -348,18 +348,32 @@ void router_mma_case(const std::vector<std::int32_t>& rows, std::int32_t k, std:
     }
     check(other_differ == 0, label + " other weights' rows equal projection_fp32");
     long slice_differ = 0;
-    for (std::int32_t first = 0; first + 256 <= t; first += 256) {
-        const std::vector<float> slice = run(first, 256, true);
-        if (std::memcmp(slice.data(), full.data() + static_cast<std::size_t>(first) * n, sizeof(float) * n * 256) != 0) {
-            ++slice_differ;
+    if (t >= 256) {
+        for (std::int32_t first = 0; first + 256 <= t; first += 256) {
+            const std::vector<float> slice = run(first, 256, true);
+            if (std::memcmp(slice.data(), full.data() + static_cast<std::size_t>(first) * n, sizeof(float) * n * 256) != 0) {
+                ++slice_differ;
+            }
+        }
+        check(slice_differ == 0, label + " 256-column slices equal the full call");
+    } else {
+        const std::vector<float> repeat = run(0, t, true);
+        check(repeat == full, label + " repeat call bitwise equal");
+        if (t > 1) {
+            const std::vector<float> one = run(0, 1, true);
+            check(std::memcmp(one.data(), full.data(), sizeof(float) * n) == 0,
+                  label + " decode column invariance against T=1");
         }
     }
-    check(slice_differ == 0, label + " 256-column slices equal the full call");
     const WeightAt w = [&](std::int32_t r, std::int32_t i) { return static_cast<double>(wv[static_cast<std::size_t>(r) * k + i]); };
-    verify(label + " (first columns)", full, w, values, n, k, 3, {});
-    const std::vector<float> tail(full.end() - static_cast<std::ptrdiff_t>(n) * 3, full.end());
-    const std::vector<float> tail_x(values.end() - static_cast<std::ptrdiff_t>(k) * 3, values.end());
-    verify(label + " (last columns)", tail, w, tail_x, n, k, 3, {});
+    if (t < 64) {
+        verify(label, full, w, values, n, k, t, {});
+    } else {
+        verify(label + " (first columns)", full, w, values, n, k, 3, {});
+        const std::vector<float> tail(full.end() - static_cast<std::ptrdiff_t>(n) * 3, full.end());
+        const std::vector<float> tail_x(values.end() - static_cast<std::ptrdiff_t>(k) * 3, values.end());
+        verify(label + " (last columns)", tail, w, tail_x, n, k, 3, {});
+    }
     if (t >= 4096) {
         Tensor x(dx, DType::BF16, {k, t}), out(dout, DType::FP32, {n, t});
         for (const bool mma : {false, true}) {
@@ -382,6 +396,54 @@ void router_mma_case(const std::vector<std::int32_t>& rows, std::int32_t k, std:
             cudaEventDestroy(begin);
             cudaEventDestroy(end);
         }
+    }
+    cudaFree(dx);
+    cudaFree(dout);
+    for (auto* p : devices) { cudaFree(p); }
+}
+
+void router_decode_bench_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> d(0.0F, 0.05F);
+    std::vector<std::uint16_t*> devices;
+    std::vector<Tensor> tensors;
+    std::int32_t n = 0;
+    for (const std::int32_t segment : rows) {
+        std::vector<std::uint16_t> part(static_cast<std::size_t>(segment) * k);
+        for (auto& v : part) { v = bf16_bits(d(rng)); }
+        devices.push_back(device(part));
+        tensors.push_back(Tensor(devices.back(), DType::BF16, {k, segment}));
+        n += segment;
+    }
+    std::vector<const Tensor*> weights;
+    for (const auto& w : tensors) { weights.push_back(&w); }
+    std::vector<std::uint16_t> bits;
+    std::vector<float> values;
+    random_activations(k, 32, seed + 13, bits, values);
+    auto* dx    = device(bits);
+    float* dout = nullptr;
+    cudaMalloc(&dout, sizeof(float) * n * 32);
+    for (const std::int32_t t : {8, 9, 12, 16, 20, 24, 32}) {
+        Tensor x(dx, DType::BF16, {k, t}), out(dout, DType::FP32, {n, t});
+        const auto time_us = [&](auto&& fn) {
+            for (int w = 0; w < 5; ++w) { fn(); }
+            cudaEvent_t begin, end;
+            cudaEventCreate(&begin);
+            cudaEventCreate(&end);
+            cudaEventRecord(begin);
+            for (int i = 0; i < 100; ++i) { fn(); }
+            cudaEventRecord(end);
+            cudaEventSynchronize(end);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, begin, end);
+            cudaEventDestroy(begin);
+            cudaEventDestroy(end);
+            return ms / 100.0F * 1000.0F;
+        };
+        const float simt_us = time_us([&] { infernix::ops::projection_fp32(x, weights, out, nullptr); });
+        const float mma_us  = time_us([&] { infernix::ops::projection_fp32_router_mma(x, weights, out, nullptr); });
+        std::cout << "router-decode N=" << n << " K=" << k << " T=" << t << " SIMT=" << simt_us
+                  << " us router_mma=" << mma_us << " us\n";
     }
     cudaFree(dx);
     cudaFree(dout);
@@ -459,9 +521,17 @@ INFERNIX_OP_TEST(projection_fp32) {
         bf16_wide_case({512, 1}, 2560, 4096, 37);  // a 4096-token prefill chunk's router
         bf16_wide_case({7, 300, 1, 64}, 3072, 301, 41); // K at its limit, partial CTA range and pass
         bf16_wide_case({129}, 1024, 135, 43);
-        router_mma_case({512, 1}, 2560, 256, 51);   // the narrowest router-mma call
+        router_mma_case({512, 1}, 2560, 256, 51);   // the narrowest wide router-mma call
         router_mma_case({512, 1}, 2560, 4096, 53);  // a 4096-token chunk (64-token tiles)
         router_mma_case({512, 1}, 2560, 9000, 57);  // past 8,192 (128-token tiles), a ragged last tile
+        for (const std::int32_t t : {9, 12, 16, 20, 24, 32}) {
+            router_mma_case({256, 1}, 2560, t, 63 + t);
+        }
+        router_mma_case({256}, 2560, 16, 97);
+        router_mma_case({512, 1}, 2560, 24, 99);
+        router_mma_case({256, 1}, 320, 16, 101); // K % 64 == 0 && K % 256 != 0 fallback
+        router_decode_bench_case({256, 1}, 2560, 103);
+        router_decode_bench_case({512, 1}, 2560, 105);
         // The Qwen3.5-122B-A10B's router (256 experts and the shared score, H 3,072: K at its limit).
         router_mma_case({256, 1}, 3072, 256, 59);
         router_mma_case({256, 1}, 3072, 4096, 61);

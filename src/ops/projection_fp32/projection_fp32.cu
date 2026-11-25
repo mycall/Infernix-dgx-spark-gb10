@@ -880,7 +880,7 @@ void projection_fp32_router_mma(const Tensor& x, std::span<const Tensor* const> 
             "x must be contiguous, 16-byte aligned BF16 [K, T]");
     require(out.data != nullptr && out.dtype == DType::FP32 && out.is_contiguous(), "out must be contiguous FP32");
     const int k = x.ne[0], columns = x.ne[1];
-    require(k > 0 && k <= kMaxK && columns >= kWideMinColumns, "router-mma: K up to 3072 and at least 64 columns");
+    require(k > 0 && k <= kMaxK && columns >= 1, "router-mma: K up to 3072 and at least 1 column");
     require(!weights.empty() && weights.size() <= kMaxSegments, "between one and four weights");
     Segments segments{};
     segments.count = static_cast<int>(weights.size());

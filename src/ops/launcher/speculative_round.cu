@@ -376,6 +376,44 @@ void speculative_accept_sparse_tree_launch(
     }
 }
 
+void speculative_accept_compact_sparse_tree_launch(
+    const Tensor& compact_ids, const Tensor& compact_logits, const Tensor& compact_counts,
+    const Tensor& drafts, const Tensor& candidate_ids, const Tensor& proposal_q,
+    const Tensor& current_extents, const Tensor& tree_rows, Tensor& round_lengths,
+    Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted_drafts, Tensor& accepted_path, Tensor& accepted_branch,
+    std::int32_t token_domain, const SamplingConfig* configs, bool update_token_counts,
+    cudaStream_t stream) {
+    const std::int32_t cap   = compact_ids.ne[0];
+    const std::int32_t cols  = drafts.ne[0] + 1;
+    const std::int32_t batch = drafts.ne[1];
+    const auto launch        = [&](auto kernel) {
+        CUDA_CHECK(pdl::launch_consumer(
+            {dim3(static_cast<unsigned int>(batch)), dim3(64), 0, stream}, kernel,
+            static_cast<const std::int32_t*>(compact_ids.data),
+            static_cast<const float*>(compact_logits.data),
+            static_cast<const std::int32_t*>(compact_counts.data),
+            static_cast<const std::int32_t*>(drafts.data),
+            static_cast<const std::int32_t*>(candidate_ids.data),
+            static_cast<const float*>(proposal_q.data),
+            static_cast<const std::int32_t*>(current_extents.data),
+            static_cast<const SpeculativeTreeRow*>(tree_rows.data),
+            static_cast<std::int32_t*>(round_lengths.data),
+            static_cast<std::int32_t*>(round_anchors.data),
+            static_cast<std::int32_t*>(licensed_tokens.data),
+            static_cast<std::int32_t*>(licensed_counts.data),
+            static_cast<std::int32_t*>(accepted_drafts.data),
+            static_cast<std::int32_t*>(accepted_path.data),
+            static_cast<std::int32_t*>(accepted_branch.data), configs, token_domain, cap, cols));
+        CUDA_CHECK(cudaGetLastError());
+    };
+    if (update_token_counts) {
+        launch(speculative_accept_compact_sparse_tree_kernel<true>);
+    } else {
+        launch(speculative_accept_compact_sparse_tree_kernel<false>);
+    }
+}
+
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,
                                                Tensor& out, cudaStream_t stream) {
     constexpr int kBlock = 256;

@@ -41,7 +41,7 @@ __device__ __forceinline__ void decode8(uint2 code, float scale, float (&w)[8]) 
 
 template <int kPassCols, bool kExactSinglePass>
 __global__ __launch_bounds__(kWarps * 32, 4) void q8_linear_swiglu_stream_pair_kernel(
-    const bf16* __restrict__ x, const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
+    const bf16* x, const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     int m_rows, int padded_k, int columns, bf16* __restrict__ out) {
     const int lane = static_cast<int>(threadIdx.x) & 31, warp = static_cast<int>(threadIdx.x) >> 5;
     const int i    = static_cast<int>(blockIdx.x) * kWarps + warp;

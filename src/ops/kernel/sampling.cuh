@@ -8,6 +8,7 @@
 // use the semantically identical single-block fallback.
 
 #include "ops/kernel/sampling_device.cuh"
+#include "infernix/ops/speculative_tree.h"
 #include "core/pdl.cuh"
 
 #include <type_traits>
@@ -635,6 +636,168 @@ __launch_bounds__(64) __global__
     }
     out[row] = picked;
     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+}
+
+template <class Logit>
+__global__ void __launch_bounds__(256)
+    filter_combined_branch_masks_kernel(const Logit* logits, const SamplingConfig* configs,
+                                        const std::int32_t* drafts, const std::int32_t* extents,
+                                        const SpeculativeTreeRow* tree_rows,
+                                        std::int32_t token_domain, std::int32_t physical_rows,
+                                        std::int32_t cols, std::int32_t drafts_k) {
+    const int col = static_cast<int>(blockIdx.x);
+    const int row = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+
+    const SamplingConfig cfg        = configs[row];
+    const std::int32_t branch_token = cfg.branch_tool_token;
+    const std::int32_t stride       = cfg.mask.stride;
+    std::uint32_t* branch_words     = cfg.branch_mask_words;
+    const int nwords                = (token_domain + 31) >> 5;
+    if (branch_token < 0 || branch_token >= token_domain || branch_words == nullptr ||
+        stride < nwords) {
+        return;
+    }
+
+    __shared__ int s_skip;
+    __shared__ int s_tree_prefix[kSpeculativeTreeMaxPathLength];
+    __shared__ int s_tree_prefix_len;
+    const std::int32_t* row_drafts =
+        drafts != nullptr ? drafts + static_cast<std::size_t>(row) * drafts_k : nullptr;
+    const bool is_tree = tree_rows != nullptr && tree_rows[row].tree != 0;
+
+    if (tid == 0) {
+        int skip          = 0;
+        s_tree_prefix_len = 0;
+        if (is_tree) {
+            const SpeculativeTreeRow& tr = tree_rows[row];
+            if (col >= tr.nodes || row_drafts == nullptr) {
+                skip = 1;
+            } else {
+                int len = 0;
+                int cur = col;
+                while (cur > 0 && len < kSpeculativeTreeMaxPathLength) {
+                    const std::int32_t tok = row_drafts[cur - 1];
+                    if (tok == branch_token) {
+                        skip = 1;
+                        break;
+                    }
+                    s_tree_prefix[len++] = tok;
+                    cur                  = static_cast<int>(tr.parent[cur]);
+                }
+                s_tree_prefix_len = len;
+            }
+        } else {
+            if (extents != nullptr) {
+                int extent = extents[row];
+                if (extent < 0) { extent = 0; }
+                if (extent > cols - 1) { extent = cols - 1; }
+                if (col > extent) { skip = 1; }
+            }
+            if (!skip && col > 0 && row_drafts != nullptr) {
+                for (int j = 0; j < col; ++j) {
+                    if (row_drafts[j] == branch_token) {
+                        skip = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        s_skip = skip;
+    }
+    __syncthreads();
+    if (s_skip != 0) { return; }
+
+    std::uint32_t* col_words        = branch_words + static_cast<std::size_t>(col) * stride;
+    const int branch_word_idx       = branch_token >> 5;
+    const std::uint32_t branch_bit  = 1U << (branch_token & 31);
+    const std::uint32_t branch_word = col_words[branch_word_idx];
+    if ((branch_word & branch_bit) == 0U) { return; }
+
+    const int last_bits           = token_domain & 31;
+    const std::uint32_t tail_mask = (last_bits == 0) ? 0xFFFFFFFFU : ((1U << last_bits) - 1U);
+
+    int local_other = 0;
+    for (int w = tid; w < nwords; w += blockDim.x) {
+        std::uint32_t bits = col_words[w];
+        if (w == nwords - 1) { bits &= tail_mask; }
+        if (w == branch_word_idx) { bits &= ~branch_bit; }
+        if (bits != 0U) {
+            local_other = 1;
+            break;
+        }
+    }
+    if (__syncthreads_or(local_other) == 0) { return; }
+
+    SamplingConfig raw_cfg        = cfg;
+    raw_cfg.mask                  = {};
+    raw_cfg.forbidden_token       = -1;
+    raw_cfg.forbidden_until_token = -1;
+
+    const std::int32_t* overlay = is_tree ? s_tree_prefix : row_drafts;
+    const int overlay_len       = is_tree ? s_tree_prefix_len : (row_drafts != nullptr ? col : 0);
+    const std::int64_t base     = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
+
+    float best_val      = -CUDART_INF_F;
+    int best_idx        = INT_MAX;
+    int local_nonfinite = 0;
+
+    for (int v = tid; v < token_domain; v += blockDim.x) {
+        const float raw = sampling_logit(logits[base + v]);
+        if (!isfinite(raw)) {
+            local_nonfinite = 1;
+            continue;
+        }
+        const float x = sampling_adjusted_logit(raw, v, raw_cfg, overlay, overlay_len);
+        if (!isfinite(x)) {
+            local_nonfinite = 1;
+            continue;
+        }
+        if (x > best_val || (x == best_val && v < best_idx)) {
+            best_val = x;
+            best_idx = v;
+        }
+    }
+    if (__syncthreads_or(local_nonfinite) != 0) { return; }
+
+    const unsigned warp_mask = 0xFFFFFFFFU;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float other_val = __shfl_down_sync(warp_mask, best_val, offset);
+        const int other_idx   = __shfl_down_sync(warp_mask, best_idx, offset);
+        if (other_idx < token_domain &&
+            (other_val > best_val || (other_val == best_val && other_idx < best_idx))) {
+            best_val = other_val;
+            best_idx = other_idx;
+        }
+    }
+
+    __shared__ float s_warp_val[8];
+    __shared__ int s_warp_idx[8];
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if (lane == 0) {
+        s_warp_val[warp] = best_val;
+        s_warp_idx[warp] = best_idx;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float wval = lane < 8 ? s_warp_val[lane] : -CUDART_INF_F;
+        int widx   = lane < 8 ? s_warp_idx[lane] : INT_MAX;
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            const float other_val = __shfl_down_sync(warp_mask, wval, offset);
+            const int other_idx   = __shfl_down_sync(warp_mask, widx, offset);
+            if (other_idx < token_domain &&
+                (other_val > wval || (other_val == wval && other_idx < widx))) {
+                wval = other_val;
+                widx = other_idx;
+            }
+        }
+        if (lane == 0 && widx >= 0 && widx < token_domain) {
+            const bool best_allowed = (col_words[widx >> 5] & (1U << (widx & 31))) != 0U;
+            if (!best_allowed) { col_words[branch_word_idx] = branch_word & ~branch_bit; }
+        }
+    }
 }
 
 } // namespace infernix::ops

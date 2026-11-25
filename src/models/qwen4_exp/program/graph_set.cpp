@@ -51,9 +51,13 @@ std::string ProgramImpl::graph_label(const DecodeGraph& graph) const {
         {"decode", graphs_, 1},
         {"screened decode", screened_graphs_, 1},
         {"verify", verify_graphs_, max_width_},
+        {"verify tail", verify_tail_graphs_, max_width_},
         {"screened verify", screened_verify_graphs_, max_width_},
+        {"screened verify tail", screened_verify_tail_graphs_, max_width_},
         {"tree verify", tree_verify_graphs_, max_width_},
+        {"tree verify tail", tree_verify_tail_graphs_, max_width_},
         {"screened tree verify", screened_tree_verify_graphs_, max_width_},
+        {"screened tree verify tail", screened_tree_verify_tail_graphs_, max_width_},
         {"commit", commit_graphs_, max_width_},
         {"MTP draft", mtp_draft_graphs_, mtp_k_},
         {"sampled MTP draft", mtp_sampled_graphs_, mtp_k_},
@@ -139,18 +143,30 @@ void ProgramImpl::capture_graph_set() {
         }
         // Verification rounds and their commits (commit_verified): the forward, the commit graph, the MTP
         // catch-up, and with both drafters bound DFlash2's context outside the commit graph.
+        const bool split_verify = verify_split_layer() > 0;
+        const auto take_verify  = [&](std::int32_t batch, std::int32_t W, bool screened, bool tree) {
+            if (!split_verify) {
+                take(verify_graph(batch, W, screened, tree),
+                     [&] { verify_graph_body(batch, W, screened, tree, ForwardPart::Full); });
+                return;
+            }
+            take(verify_graph(batch, W, screened, tree),
+                 [&] { verify_graph_body(batch, W, screened, tree, ForwardPart::Head); });
+            take(verify_tail_graph(batch, W, screened, tree),
+                 [&] { verify_graph_body(batch, W, screened, tree, ForwardPart::Tail); });
+        };
         for (const auto& shape : verified) {
             const std::int32_t batch = shape.first, widest = bucket_verify_width(shape.second, max_width_);
             for (std::int32_t W = 2; W <= widest; ++W) {
                 if (W != bucket_verify_width(W, max_width_)) { continue; }
-                take(verify_graph(batch, W, false), [&] { verify_graph_body(batch, W, false); });
+                take_verify(batch, W, false, false);
                 if (screened_head_ && batch * W <= ops::kScreenedHeadMaxColumns) {
-                    take(verify_graph(batch, W, true), [&] { verify_graph_body(batch, W, true); });
+                    take_verify(batch, W, true, false);
                 }
                 if (options_.univer_trees && batch <= 2 && W >= 3 && W <= ops::kSpeculativeTreeMaxNodes) {
-                    take(verify_graph(batch, W, false, true), [&] { verify_graph_body(batch, W, false, true); });
+                    take_verify(batch, W, false, true);
                     if (screened_head_ && batch * W <= ops::kScreenedHeadMaxColumns) {
-                        take(verify_graph(batch, W, true, true), [&] { verify_graph_body(batch, W, true, true); });
+                        take_verify(batch, W, true, true);
                     }
                 }
                 take(commit_graph(batch, W), [&] { commit_body(batch, W); });

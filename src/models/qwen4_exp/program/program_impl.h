@@ -492,6 +492,7 @@ public:
         NgramVolume::Counters ngram; // this request's n-gram row traffic
         GateTraffic gate;            // its verification rounds' rows read behind the n-gram gate
         std::unique_ptr<qwen3_5::detail::NgramProposer> proposer; // copy proposals over history
+        qwen3_5::detail::DualGenSuffixAutomaton::Cursor cross_cursor{};
         SpeculativeStats speculative;
         // MTP drafter (design 11.2; rule MR1 of 19.3.1): its KV cells [0, mtp_cells) are final. At
         // every settled point the lane's saved column holds the residual of position
@@ -1041,6 +1042,12 @@ public:
         screened_head_ = options_.screened_lm_head;
         if (screened_head_ && !parameters_.output_head_screen) {
             throw std::logic_error("Qwen4Exp: screened-lm-head needs the LM head's bound screen");
+        }
+        if (options_.ngram_draft_tokens > 0 && max_width_ > 1 &&
+            !options_.gumbel_sampling && options_.pair_speculation && !c_.lossless) {
+            constexpr std::size_t kCrossRequestCapacity = 1U << 18;
+            cross_request_proposer_ = std::make_unique<qwen3_5::detail::DualGenNgramProposer>(
+                kCrossRequestCapacity, kCrossRequestCapacity / 2);
         }
         probe_ngram_volume();
 
@@ -1916,6 +1923,7 @@ public:
         lane.dflash_calibration = dflash_process_calibration_;
         if (max_width_ > 1) {
             if (options_.ngram_draft_tokens > 0) {
+                init_cross_boundaries(data.ngram_boundaries);
                 if (b.ngram_index && *b.ngram_index &&
                     (*b.ngram_index)->capacity() >= proposer_tokens_) {
                     lane.proposer = std::move(*b.ngram_index);
@@ -1926,6 +1934,14 @@ public:
                     lane.proposer->ingest(lane.history);
                     for (const auto& src : data.ngram_sources) { lane.proposer->ingest(src); }
                 }
+                if (cross_request_proposer_ && lane.history.size() >= 4U) {
+                    try {
+                        const std::size_t keep = std::min(lane.history.size(), cross_request_proposer_->capacity());
+                        cross_request_proposer_->ingest(std::span<const std::int32_t>(lane.history).last(keep));
+                    } catch (...) {
+                    }
+                }
+                lane.cross_cursor = {};
             }
             lane.speculative.enabled      = true;
             lane.speculative.backend      = mtp_       ? SpeculativeBackend::Mtp
@@ -2158,10 +2174,19 @@ public:
         lane.next_call = 0;
         clear_prompt_uses(lane);
         if (max_width_ > 1 && options_.ngram_draft_tokens > 0) {
+            init_cross_boundaries(prompt.ngram_boundaries);
             lane.proposer = std::make_unique<qwen3_5::detail::NgramProposer>(proposer_tokens_, proposer_tokens_ / 2);
             lane.proposer->set_boundaries(prompt.ngram_boundaries);
             lane.proposer->ingest(lane.history);
             for (const auto& src : prompt.ngram_sources) { lane.proposer->ingest(src); }
+            if (cross_request_proposer_ && lane.history.size() >= 4U) {
+                try {
+                    const std::size_t keep = std::min(lane.history.size(), cross_request_proposer_->capacity());
+                    cross_request_proposer_->ingest(std::span<const std::int32_t>(lane.history).last(keep));
+                } catch (...) {
+                }
+            }
+            lane.cross_cursor = {};
         }
         lane.sampling = b.sampling;
         lane.sampling.token_counts =
@@ -2710,8 +2735,12 @@ public:
             Lane& lane = lanes_[lanes[b]];
             drafts_[b].clear();
             from_ngram_[b] = false;
+            ngram_alt_token_[b]          = -1;
+            ngram_alt_q0_[b]             = 1.0F;
             ngram_proposal_[b].clear();
-            ngram_proposal_bucket_[b] = -1;
+            ngram_proposal_bucket_[b]    = -1;
+            ngram_proposal_alt_token_[b] = -1;
+            ngram_proposal_alt_q0_[b]    = 1.0F;
             const std::uint32_t remaining =
                 static_cast<std::size_t>(b) < budgets.size() ? budgets[b].generated_tokens_remaining : 0U;
             if (remaining < 2) { continue; }
@@ -2735,7 +2764,23 @@ public:
                                                     : (kMultiRowDrafts > 0.5 ? std::min(kMultiRowNgramMaxDrafts, 64 / batch - 1) : 0))));
                 const auto tail = std::span<const std::int32_t>(lane.history)
                                       .last(std::min<std::size_t>(qwen3_5::kNgramMatchHistoryTokens, lane.history.size()));
-                auto match       = lane.proposer->propose(tail, ngram_limit, options_.ngram_min_match);
+                const std::uint32_t effective_min = std::min<std::uint32_t>(options_.ngram_min_match, 4U);
+                auto match = lane.proposer->propose(tail, ngram_limit, effective_min);
+                if (match.matched < options_.ngram_min_match && match.occurrences < 3U) {
+                    match.tokens.clear();
+                }
+                if (cross_request_proposer_ &&
+                    (match.tokens.empty() || match.tokens.size() < ngram_limit)) {
+                    if (lane.cross_cursor.generation != cross_request_proposer_->generation()) {
+                        lane.cross_cursor = cross_request_proposer_->cursor_from(lane.history);
+                    }
+                    auto cross = cross_request_proposer_->propose_from_cursor(
+                        lane.cross_cursor, ngram_limit, effective_min);
+                    if (cross.matched < options_.ngram_min_match && cross.occurrences < 3U) {
+                        cross.tokens.clear();
+                    }
+                    match = select_ngram_proposal(std::move(match), std::move(cross));
+                }
                 const int bucket = ngram_confidence_bucket(match.matched, match.occurrences, match.distance, false);
                 if (!match.tokens.empty() && options_.auto_draft_length) {
                     const std::int32_t opt = best_copy_len_for(
@@ -2753,13 +2798,17 @@ public:
                                              lane.mtp_accept, chain_compare, batch, dflash2_, false);
                 }
                 if (take) {
-                    drafts_[b]       = std::move(match.tokens);
-                    from_ngram_[b]   = true;
-                    ngram_bucket_[b] = bucket;
-                    extents[b]       = static_cast<std::int32_t>(drafts_[b].size());
+                    drafts_[b]          = std::move(match.tokens);
+                    from_ngram_[b]      = true;
+                    ngram_bucket_[b]    = bucket;
+                    ngram_alt_token_[b] = match.alt_token;
+                    ngram_alt_q0_[b]    = ngram_branch_q0(match.occurrences, match.alt_occurrences);
+                    extents[b]          = static_cast<std::int32_t>(drafts_[b].size());
                 } else if (!match.tokens.empty()) {
-                    ngram_proposal_[b]        = std::move(match.tokens);
-                    ngram_proposal_bucket_[b] = bucket;
+                    ngram_proposal_[b]           = std::move(match.tokens);
+                    ngram_proposal_bucket_[b]    = bucket;
+                    ngram_proposal_alt_token_[b] = match.alt_token;
+                    ngram_proposal_alt_q0_[b]    = ngram_branch_q0(match.occurrences, match.alt_occurrences);
                 }
             }
             width = std::max(width, 1 + extents[b]);
@@ -2796,16 +2845,75 @@ public:
                         copies,
                         lanes_[lanes[b]].ngram_accept[static_cast<std::size_t>(ngram_proposal_bucket_[b])],
                         lanes_[lanes[b]].mtp_accept, chain_ext, batch, false, true)) {
-                    drafts_[b]                = ngram_proposal_[b];
-                    from_ngram_[b]            = true;
-                    ngram_bucket_[b]          = ngram_proposal_bucket_[b];
-                    extents[b]                = copies;
+                    drafts_[b]                   = ngram_proposal_[b];
+                    from_ngram_[b]               = true;
+                    ngram_bucket_[b]             = ngram_proposal_bucket_[b];
+                    ngram_alt_token_[b]          = ngram_proposal_alt_token_[b];
+                    ngram_alt_q0_[b]             = ngram_proposal_alt_q0_[b];
+                    extents[b]                   = copies;
                     ngram_proposal_[b].clear();
-                    ngram_proposal_bucket_[b] = -1;
+                    ngram_proposal_bucket_[b]    = -1;
+                    ngram_proposal_alt_token_[b] = -1;
+                    ngram_proposal_alt_q0_[b]    = 1.0F;
                     continue;
                 }
                 extents[b] = chain_ext;
                 drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + extents[b]);
+            }
+            if (max_width_ > 1 && batch >= 2 && options_.auto_draft_length &&
+                need_mtp_logprobs(batch, mtp_sampled_round_)) {
+                std::array<std::int32_t, kMaximumConcurrency> dcut_extents{};
+                std::array<std::array<double, 8>, kMaximumConcurrency> dcut_rates{};
+                std::int32_t max_neural_ext = 0;
+                std::int32_t max_ngram_ext  = 0;
+                for (std::int32_t b = 0; b < batch; ++b) {
+                    if (from_ngram_[b]) {
+                        max_ngram_ext = std::max(max_ngram_ext, extents[b]);
+                        continue;
+                    }
+                    const std::int32_t re = std::clamp(extents[b], 0, 8);
+                    dcut_extents[b]       = re;
+                    max_neural_ext        = std::max(max_neural_ext, re);
+                    const Lane& lane      = lanes_[lanes[b]];
+                    const bool row_sampled =
+                        mtp_sampled_round_ && lane.sampling.temperature > 0.0F;
+                    const auto& bins = row_sampled ? kMtpSampledCumulativeBins : kMtpCumulativeBins;
+                    for (std::int32_t j = 0; j < re; ++j) {
+                        const float raw_rate = graph_gate_rate(
+                            mtp_draft_logprobs_[static_cast<std::size_t>(b)][static_cast<std::size_t>(j)], bins);
+                        dcut_rates[b][static_cast<std::size_t>(j)] = calibrate_dcut_rate(
+                            raw_rate, lane.mtp_cumulative.observed, lane.mtp_cumulative.expected,
+                            lane.mtp_accept[static_cast<std::size_t>(j)], row_sampled);
+                    }
+                }
+                if (max_neural_ext > 1) {
+                    const double dense_equiv   = dense_equiv_experts();
+                    const std::int32_t experts = dim(c_.moe.experts), top_k = dim(c_.moe.top_k);
+                    const bool fixed_override =
+                        batch == 2 ? (replay_clock_ || kHasPairWidthCostOverride)
+                                   : (replay_clock_ || kHasMultiRowWidthCostOverride || options_.device_experts);
+                    const double slope     = batch == 2 ? kPairWidthCost : kMultiRowWidthCost;
+                    const double tile_cost = std::min(slope, 0.10);
+                    const auto cost_fn     = [&](std::int32_t w) noexcept {
+                        const std::int32_t vw = std::max(max_ngram_ext, w);
+                        if (vw <= 0) { return 1.0; }
+                        return fixed_override
+                                   ? (1.0 + (vw <= 3 ? tile_cost * vw : tile_cost * 3 + slope * (vw - 3)))
+                                   : moe_round_cost(batch, vw, experts, top_k, dense_equiv, 0.0);
+                    };
+                    const std::int32_t cap = choose_dcut_batch_cap(
+                        batch, std::span<const std::int32_t>(dcut_extents.data(), static_cast<std::size_t>(batch)),
+                        std::span<const std::array<double, 8>>(dcut_rates.data(), static_cast<std::size_t>(batch)),
+                        cost_fn);
+                    if (cap < max_neural_ext) {
+                        for (std::int32_t b = 0; b < batch; ++b) {
+                            if (!from_ngram_[b] && extents[b] > cap) {
+                                extents[b] = cap;
+                                drafts_[b].resize(static_cast<std::size_t>(cap));
+                            }
+                        }
+                    }
+                }
             }
             if (max_width_ > 1) {
                 stitch_neural_drafts(std::span<const std::uint32_t>(lanes.data(), batch), budgets, extents, false,
@@ -2880,13 +2988,17 @@ public:
                             dflash_tokens / (1.0 + cost * static_cast<double>(extents[b]));
                         if (copy_score > dflash_score) {
                             ngram_proposal_[b].resize(static_cast<std::size_t>(max_copies));
-                            drafts_[b]                = std::move(ngram_proposal_[b]);
-                            from_ngram_[b]            = true;
-                            ngram_bucket_[b]          = ngram_proposal_bucket_[b];
-                            extents[b]                = max_copies;
+                            drafts_[b]                   = std::move(ngram_proposal_[b]);
+                            from_ngram_[b]               = true;
+                            ngram_bucket_[b]             = ngram_proposal_bucket_[b];
+                            ngram_alt_token_[b]          = ngram_proposal_alt_token_[b];
+                            ngram_alt_q0_[b]             = ngram_proposal_alt_q0_[b];
+                            extents[b]                   = max_copies;
                             ngram_proposal_[b].clear();
-                            ngram_proposal_bucket_[b] = -1;
-                            staged[b]                 = std::min(staged[b], 1);
+                            ngram_proposal_bucket_[b]    = -1;
+                            ngram_proposal_alt_token_[b] = -1;
+                            ngram_proposal_alt_q0_[b]    = 1.0F;
+                            staged[b]                    = std::min(staged[b], 1);
                             continue;
                         }
                     }
@@ -2974,8 +3086,9 @@ public:
             // The model reads the pending input token and every forced token but the last, which
             // becomes the next decode input.
             lane.history.insert(lane.history.end(), forced.begin(), forced.end());
-            if (lane.proposer) {
-                for (const auto token : forced) { lane.proposer->append(token); }
+            for (const auto token : forced) {
+                if (lane.proposer) { lane.proposer->append(token); }
+                if (cross_request_proposer_) { cross_request_proposer_->advance_cursor(lane.cross_cursor, token); }
             }
             const auto begin = static_cast<std::int32_t>(lane.state_tokens);
             stage_sequence(index, begin, static_cast<std::int32_t>(stride), lane.history);
@@ -3069,6 +3182,9 @@ public:
                 any_cell    = true;
             }
             if (lane.proposer) { lane.proposer->append(pending_tokens_[row]); }
+            if (cross_request_proposer_) {
+                cross_request_proposer_->advance_cursor(lane.cross_cursor, pending_tokens_[row]);
+            }
             if (lane.phase == Phase::Prefill) { lane.phase = Phase::Decode; }
             if (d.terminal) {
                 lane.phase                = Phase::Finishable;
@@ -4128,8 +4244,16 @@ private:
         lane.pages.clear();
         lane.reservation.reset();
         lane.row = KVExecutionRowLease{};
+        if (cross_request_proposer_ && !lane.prefix.withdraw && !lane.history.empty() &&
+            lane.history.size() >= options_.ngram_min_match) {
+            try {
+                const std::size_t keep = std::min(lane.history.size(), cross_request_proposer_->capacity());
+                cross_request_proposer_->ingest(std::span<const std::int32_t>(lane.history).last(keep));
+            } catch (...) {}
+        }
         lane.history.clear();
         lane.history.shrink_to_fit();
+        lane.cross_cursor = {};
         lane.rope = {};
         if (lane.vision) { vision_release(lane); }
         lane.proposer.reset();
@@ -5223,20 +5347,32 @@ private:
         const execution::NgramRowGate gate = row_gate();
         forward_call(batch, 1, batch, nullptr, nullptr, nullptr, &gate, false, /*decode_round=*/true, screened);
     }
+    enum class ForwardPart { Full, Head, Tail };
+    [[nodiscard]] std::uint32_t verify_split_layer() const noexcept {
+        return c_.num_hidden_layers > 3 ? 3U : 0U;
+    }
     DecodeGraph& verify_graph(std::int32_t batch, std::int32_t W, bool screened, bool tree = false) {
         auto& table = tree ? (screened ? screened_tree_verify_graphs_ : tree_verify_graphs_)
                            : (screened ? screened_verify_graphs_ : verify_graphs_);
         return table[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
     }
-    // A verification round's forward over batch x W columns.
-    void verify_graph_body(std::int32_t batch, std::int32_t W, bool screened, bool tree = false) {
+    DecodeGraph& verify_tail_graph(std::int32_t batch, std::int32_t W, bool screened, bool tree = false) {
+        auto& table = tree ? (screened ? screened_tree_verify_tail_graphs_ : tree_verify_tail_graphs_)
+                           : (screened ? screened_verify_tail_graphs_ : verify_tail_graphs_);
+        return table[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
+    }
+    // A verification round's forward over batch x W columns (monolithic or head/tail split).
+    void verify_graph_body(std::int32_t batch, std::int32_t W, bool screened, bool tree = false,
+                           ForwardPart part = ForwardPart::Full) {
         const execution::ForwardVerify view = verify_view(batch, W, tree);
         if (use_direct_ple()) {
-            forward_call(batch, W, batch * W, &view, nullptr, nullptr, nullptr, false, /*decode_round=*/true, screened);
+            forward_call(batch, W, batch * W, &view, nullptr, nullptr, nullptr, false, /*decode_round=*/true, screened,
+                         part);
             return;
         }
         const execution::NgramRowGate gate = row_gate();
-        forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate, false, /*decode_round=*/true, screened);
+        forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate, false, /*decode_round=*/true, screened,
+                     part);
     }
     DecodeGraph& commit_graph(std::int32_t batch, std::int32_t W) {
         return commit_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
@@ -5392,9 +5528,13 @@ private:
         std::ptrdiff_t stride  = 1;
         if (at < 0) { at = route_trace_index(screened_graphs_, &graph); }
         if (at < 0 && ((at = route_trace_index(verify_graphs_, &graph)) >= 0 ||
+                       (at = route_trace_index(verify_tail_graphs_, &graph)) >= 0 ||
                        (at = route_trace_index(screened_verify_graphs_, &graph)) >= 0 ||
+                       (at = route_trace_index(screened_verify_tail_graphs_, &graph)) >= 0 ||
                        (at = route_trace_index(tree_verify_graphs_, &graph)) >= 0 ||
-                       (at = route_trace_index(screened_tree_verify_graphs_, &graph)) >= 0)) {
+                       (at = route_trace_index(tree_verify_tail_graphs_, &graph)) >= 0 ||
+                       (at = route_trace_index(screened_tree_verify_graphs_, &graph)) >= 0 ||
+                       (at = route_trace_index(screened_tree_verify_tail_graphs_, &graph)) >= 0)) {
             family = RouteTraceGraph::Verify;
             stride = max_width_;
         } else if (at < 0 && ((at = route_trace_index(mtp_draft_graphs_, &graph)) >= 0 ||
@@ -5429,7 +5569,8 @@ private:
     void forward_call(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
                       const execution::ForwardVerify* verify = nullptr, const execution::MtpChunk* chunk = nullptr,
                       const execution::VisionInput* vision = nullptr, const execution::NgramRowGate* gate = nullptr,
-                      bool streamed = false, bool decode_round = false, bool screened_head = false) {
+                      bool streamed = false, bool decode_round = false, bool screened_head = false,
+                      ForwardPart part = ForwardPart::Full) {
         require_tier_round();
         execution::ForwardBatch fb = io_batch(static_cast<std::byte*>(io_device_.p), batch, width, logit_columns);
         fb.decode_round  = decode_round;
@@ -5482,8 +5623,7 @@ private:
             fb.lossless_keys      = *std::max_element(positions, positions + cols) + 1;
         }
         execution::ForwardBatch::ScreenedCompactOut compact_out;
-        const bool is_tree = verify != nullptr && verify->tree_rows.data != nullptr;
-        const bool compact = !is_tree && use_screened_compact(screened_head) && logit_columns > 0;
+        const bool compact = use_screened_compact(screened_head) && logit_columns > 0;
         if (compact) {
             compact_out.ids     = Tensor(compact_ids_.p, DType::I32, {kCompactCap, logit_columns});
             compact_out.logits  = Tensor(compact_logits_.p, DType::FP32, {kCompactCap, logit_columns});
@@ -5491,7 +5631,16 @@ private:
             fb.screened_compact = &compact_out;
         }
         Tensor logits = head_logits(logit_columns);
-        forward_->run(fb, logits);
+        if (part == ForwardPart::Head) {
+            forward_->run_range(fb, logits, 0, verify_split_layer(), /*do_embed=*/true, /*do_finish=*/false);
+            return;
+        }
+        if (part == ForwardPart::Tail) {
+            forward_->run_range(fb, logits, verify_split_layer(), c_.num_hidden_layers, /*do_embed=*/false,
+                                /*do_finish=*/true);
+        } else {
+            forward_->run(fb, logits);
+        }
         if (!compact) { round_logits(logit_columns, device_.stream); }
     }
 
@@ -5560,6 +5709,16 @@ private:
         if (options_.univer_trees) {
             tree_verify_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
             if (screened_head_) { screened_tree_verify_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_); }
+        }
+        if (verify_split_layer() > 0) {
+            verify_tail_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
+            if (screened_head_) { screened_verify_tail_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_); }
+            if (options_.univer_trees) {
+                tree_verify_tail_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
+                if (screened_head_) {
+                    screened_tree_verify_tail_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
+                }
+            }
         }
         const std::size_t cells = static_cast<std::size_t>(lanes) * max_width_;
         spec_layout_ = plan_.spec;
@@ -5648,7 +5807,7 @@ private:
             for (std::int32_t b = 0; b < batch; ++b) {
                 const Lane& lane = lanes_[lanes[b]];
                 const auto n     = static_cast<std::int32_t>(drafts_[b].size());
-                if (from_ngram_[b] || stitched_ngram_[b] || !(lane.sampling.temperature > 0.0F) || n < 1 ||
+                if (stitched_ngram_[b] || !(lane.sampling.temperature > 0.0F) || n < 1 ||
                     n > ops::kSpeculativeTreeMaxPathLength - 1 ||
                     n + 2 > std::min(max_width_, ops::kSpeculativeTreeMaxNodes)) {
                     continue;
@@ -5658,6 +5817,15 @@ private:
                 const std::int32_t lane_limit =
                     std::min({model_limit, static_cast<std::int32_t>(lane.extent), allocated_kv});
                 if (positions[b] + n + 2 > lane_limit) { continue; }
+                if (from_ngram_[b]) {
+                    if ((r_ <= 1 || (positions[b] % r_) != (r_ - 2)) &&
+                        ngram_alt_token_[b] >= 0 && ngram_alt_token_[b] != drafts_[b][0]) {
+                        row_is_tree_[b]     = true;
+                        tree_side_token_[b] = ngram_alt_token_[b];
+                        width               = std::max(width, n + 2);
+                    }
+                    continue;
+                }
                 const std::int32_t* cands = nullptr;
                 const float* qs           = nullptr;
                 if (dflash_sampled_preview) {
@@ -5765,10 +5933,13 @@ private:
         const bool direct_ple    = use_direct_ple();
         const std::uint32_t word = next_gate_word();
         const bool screened      = screened_round(lanes, batch * W);
-        DecodeGraph& graph       = verify_graph(batch, W, screened, tree_round);
-        std::int32_t total_cols  = 0;
-        bool contiguous          = true;
-        bool gated               = false;
+        const std::uint32_t split = verify_split_layer();
+        DecodeGraph& graph        = verify_graph(batch, W, screened, tree_round);
+        DecodeGraph* tail         = split > 0 ? &verify_tail_graph(batch, W, screened, tree_round) : nullptr;
+        const bool graphs_ready   = graph.executable.ready() && (tail == nullptr || tail->executable.ready());
+        std::int32_t total_cols   = 0;
+        bool contiguous           = true;
+        bool gated                = false;
         if (direct_ple) {
             stage_ple_windows_verify(lanes, positions, W, tree_round);
         } else {
@@ -5776,7 +5947,7 @@ private:
                 lanes, std::span<const std::int32_t>(positions.data(), batch), W,
                 std::span<const std::int32_t>(clamped_staged.data(), batch),
                 std::span<const std::int32_t>(to.data(), batch), tree_round);
-            gated = graph.executable.ready() && total_cols > 0 && !volume_.cached(row_ids_);
+            gated = graphs_ready && total_cols > 0 && !volume_.cached(row_ids_);
             if (!gated) {
                 read_prepared_verify_ngram_batch(lanes, W, std::span<const std::int32_t>(clamped_staged.data(), batch),
                                                  std::span<const std::int32_t>(to.data(), batch), total_cols, contiguous);
@@ -5787,21 +5958,33 @@ private:
         upload_pinned(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
         if (!options_.device_experts) { residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active); }
-        replay(graph, [&] { verify_graph_body(batch, W, screened, tree_round); });
-        if (gated) {
-            read_behind_gate(lanes, word, ngram_rows_bytes(batch * W), [&] {
-                read_prepared_verify_ngram_batch(lanes, W, std::span<const std::int32_t>(clamped_staged.data(), batch),
-                                                 std::span<const std::int32_t>(to.data(), batch), total_cols, contiguous);
-            });
+        if (tail == nullptr) {
+            replay(graph, [&] { verify_graph_body(batch, W, screened, tree_round, ForwardPart::Full); });
+            if (gated) {
+                read_behind_gate(lanes, word, ngram_rows_bytes(batch * W), [&] {
+                    read_prepared_verify_ngram_batch(lanes, W, std::span<const std::int32_t>(clamped_staged.data(), batch),
+                                                     std::span<const std::int32_t>(to.data(), batch), total_cols, contiguous);
+                });
+            }
+        } else {
+            replay(graph, [&] { verify_graph_body(batch, W, screened, tree_round, ForwardPart::Head); });
+            if (gated) {
+                device_.flush();
+                read_behind_gate(lanes, word, ngram_rows_bytes(batch * W), [&] {
+                    read_prepared_verify_ngram_batch(lanes, W, std::span<const std::int32_t>(clamped_staged.data(), batch),
+                                                     std::span<const std::int32_t>(to.data(), batch), total_cols, contiguous);
+                });
+            }
+            replay(*tail, [&] { verify_graph_body(batch, W, screened, tree_round, ForwardPart::Tail); });
         }
         if (track_routes()) { residency_->enqueue_route_download(s, batch * W); }
 
-        // Acceptance on the device, from compact candidates on unconstrained non-tree screened-head
-        // rounds or the full logits plain decode samples (FP32, or BF16: design 16.5); constraints mask in place.
+        // Acceptance on the device, from compact candidates on unconstrained screened-head rounds or the
+        // full logits plain decode samples (FP32, or BF16: design 16.5); constraints mask in place.
         Tensor logits = read_logits(batch * W);
         Tensor target(spec_device(spec_layout_.target), DType::I32, {batch * W});
         const bool constrained    = stage_constraints(lanes, W);
-        const bool compact_accept = !tree_round && use_screened_compact(screened) && !constrained;
+        const bool compact_accept = use_screened_compact(screened) && !constrained;
         bool need_target          = !compact_accept && constrained;
         for (std::int32_t b = 0; b < batch && !compact_accept && !need_target; ++b) {
             const ops::SamplingConfig& s_cfg = lanes_[lanes[b]].sampling;
@@ -5819,7 +6002,8 @@ private:
             c_logits = Tensor(compact_logits_.p, DType::FP32, {kCompactCap, W, batch});
             c_counts = Tensor(compact_counts_.p, DType::I32, {W, batch});
         }
-        auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
+        auto* configs        = static_cast<ops::SamplingConfig*>(host_configs_.data());
+        bool any_branch_gate = false;
         for (std::int32_t b = 0; b < batch; ++b) {
             configs[b]      = lanes_[lanes[b]].sampling;
             configs[b].mask = grammar_mask(static_cast<std::size_t>(b), drafts_[b]);
@@ -5827,11 +6011,28 @@ private:
                 const auto ft                    = grammar_->forbidden_token(static_cast<std::size_t>(b));
                 configs[b].forbidden_token       = ft.token;
                 configs[b].forbidden_until_token = ft.until_token;
+                const std::int32_t branch_tool   = grammar_->branch_tool_token(static_cast<std::size_t>(b));
+                configs[b].branch_tool_token     = branch_tool;
+                configs[b].branch_mask_words     = branch_tool >= 0 ? const_cast<std::uint32_t*>(configs[b].mask.words) : nullptr;
+                any_branch_gate = any_branch_gate || branch_tool >= 0;
             }
         }
         upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
         Tensor drafts(spec_device(spec_layout_.drafts), DType::I32, {K, batch});
         Tensor extents(spec_device(spec_layout_.extents), DType::I32, {batch});
+        if (any_branch_gate) {
+            if (tree_round) {
+                Tensor tree_rows_dev(spec_device(spec_layout_.tree_rows), DType::I32,
+                                     {ops::kSpeculativeTreeRowWords, batch});
+                ops::filter_combined_branch_masks(logits.view({vocab_, W, batch}), token_domain_,
+                                                  static_cast<const ops::SamplingConfig*>(configs_.p), s,
+                                                  drafts, extents, tree_rows_dev);
+            } else {
+                ops::filter_combined_branch_masks(logits.view({vocab_, W, batch}), token_domain_,
+                                                  static_cast<const ops::SamplingConfig*>(configs_.p), s,
+                                                  drafts, extents);
+            }
+        }
         Tensor lengths(spec_device(spec_layout_.lengths), DType::I32, {batch});
         Tensor anchors(spec_device(spec_layout_.anchors), DType::I32, {batch});
         Tensor licensed(spec_device(spec_layout_.licensed), DType::I32, {W, batch});
@@ -5884,6 +6085,23 @@ private:
                         const std::size_t tail = static_cast<std::size_t>(n - neural_n);
                         for (std::int32_t j = neural_n; j < n; ++j) {
                             const std::int32_t token = drafts_[b][static_cast<std::size_t>(j)];
+                            if (j == 0 && row_is_tree_[b] && from_ngram_[b] && tree_side_token_[b] != token) {
+                                const float q0           = ngram_alt_q0_[b];
+                                host_candidates[row + 0] = token;
+                                host_q[row + 0]          = q0;
+                                host_candidates[row + 1] = tree_side_token_[b];
+                                host_q[row + 1]          = 1.0F - q0;
+                                std::int32_t filler      = (token + 1) % token_domain_;
+                                for (std::int32_t c = 2; c < C; ++c) {
+                                    while (filler == token || filler == tree_side_token_[b]) {
+                                        filler = (filler + 1) % token_domain_;
+                                    }
+                                    host_candidates[row + c] = filler;
+                                    host_q[row + c]          = 0.0F;
+                                    filler                   = (filler + 1) % token_domain_;
+                                }
+                                continue;
+                            }
                             for (std::int32_t c = 0; c < C; ++c) {
                                 host_candidates[row + j * C + c] = (token + c) % token_domain_;
                                 host_q[row + j * C + c]          = c == 0 ? 1.0F : 0.0F;
@@ -5902,7 +6120,13 @@ private:
                                  {ops::kSpeculativeTreeRowWords, batch});
             Tensor accepted_path(spec_device(spec_layout_.accepted_path), DType::I32, {W, batch});
             Tensor accepted_branch(spec_device(spec_layout_.accepted_branch), DType::I32, {batch});
-            {
+            if (compact_accept) {
+                ops::speculative_accept_compact_sparse_tree(
+                    c_ids, c_logits, c_counts, drafts, candidates, q, extents, tree_rows_dev,
+                    lengths, anchors, licensed, counts, accepted, accepted_path, accepted_branch,
+                    token_domain_, static_cast<const ops::SamplingConfig*>(configs_.p), s,
+                    {.update_token_counts = true});
+            } else {
                 auto scope = work_->scope();
                 ops::speculative_accept_sparse_tree(
                     target.view({W, batch}), logits.view({vocab_, W, batch}), drafts, candidates, q, extents,
@@ -6209,6 +6433,7 @@ private:
                 const std::int32_t token = pending_tokens_[static_cast<std::size_t>(row * W + j)];
                 lane.history.push_back(token);
                 if (lane.proposer) { lane.proposer->append(token); }
+                if (cross_request_proposer_) { cross_request_proposer_->advance_cursor(lane.cross_cursor, token); }
             }
             fold_rows[row].commit_columns = k;
             commit[row]                   = k;
@@ -6519,7 +6744,7 @@ private:
         std::int32_t best         = 0;
         double best_score         = static_cast<double>(batch);
         double tokens             = static_cast<double>(batch);
-        const bool fixed_override = replay_clock_ || kHasMultiRowWidthCostOverride;
+        const bool fixed_override = replay_clock_ || kHasMultiRowWidthCostOverride || options_.device_experts;
         const double tile_cost    = std::min(kMultiRowWidthCost, 0.10);
         const auto [dense_equiv, step_cost] = learned_round_costs();
         const std::int32_t experts = dim(c_.moe.experts), top_k = dim(c_.moe.top_k);
@@ -6560,7 +6785,7 @@ private:
                                          std::int32_t batch, bool is_dflash2, bool step_sunk) const noexcept {
         const bool batch_override = !is_dflash2 && ((batch == 1 && kHasWidthCostOverride) ||
                                                     (batch == 2 && kHasPairWidthCostOverride) ||
-                                                    (batch >= 3 && kHasMultiRowWidthCostOverride));
+                                                    (batch >= 3 && (kHasMultiRowWidthCostOverride || options_.device_experts)));
         if (replay_clock_ || kHasNgramWidthCostOverride || batch_override) {
             const double chain_cost =
                 is_dflash2 ? kWidthCost
@@ -6614,6 +6839,10 @@ private:
             std::copy(drafts_[b].begin(), drafts_[b].end(), ext_tail.begin() + static_cast<std::ptrdiff_t>(hist_keep));
             const std::uint32_t stitch_min = std::min<std::uint32_t>(options_.ngram_min_match, 5U);
             auto match                     = lane.proposer->propose(ext_tail, max_stitch, stitch_min);
+            if (cross_request_proposer_ && match.tokens.empty()) {
+                const std::uint32_t cross_stitch_min = std::max<std::uint32_t>(stitch_min, 6U);
+                match = cross_request_proposer_->propose(ext_tail, max_stitch, cross_stitch_min);
+            }
             if (match.tokens.empty()) { continue; }
             if (!(match.matched >= 6U || (match.matched >= 5U && (match.occurrences >= 2U || match.distance <= 2048U)))) {
                 continue;
@@ -7006,8 +7235,9 @@ private:
         // The sampler reads the FP32 logits, or BF16 (design §16.5); a constraint masks them in place (the prompt
         // readout has read them first).
         Tensor logits = read_logits(batch);
-        auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
+        auto* configs          = static_cast<ops::SamplingConfig*>(host_configs_.data());
         auto* sample_positions = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
+        bool any_branch_gate   = false;
         for (std::int32_t b = 0; b < batch; ++b) {
             configs[b]          = lanes_[lanes[b]].sampling;
             configs[b].mask     = grammar_mask(static_cast<std::size_t>(b), {});
@@ -7015,6 +7245,10 @@ private:
                 const auto ft                    = grammar_->forbidden_token(static_cast<std::size_t>(b));
                 configs[b].forbidden_token       = ft.token;
                 configs[b].forbidden_until_token = ft.until_token;
+                const std::int32_t branch_tool   = grammar_->branch_tool_token(static_cast<std::size_t>(b));
+                configs[b].branch_tool_token     = branch_tool;
+                configs[b].branch_mask_words     = branch_tool >= 0 ? const_cast<std::uint32_t*>(configs[b].mask.words) : nullptr;
+                any_branch_gate = any_branch_gate || branch_tool >= 0;
             }
             sample_positions[b] = positions[b];
         }
@@ -7022,6 +7256,10 @@ private:
         upload_pinned(sample_pos_.p, sample_positions, 4ULL * batch, s);
         const bool constrained = stage_constraints(lanes, 1);
         if (constrained) { constrain(logits, nullptr); }
+        if (any_branch_gate) {
+            ops::filter_combined_branch_masks(logits, token_domain_,
+                                              static_cast<const ops::SamplingConfig*>(configs_.p), s);
+        }
         Tensor out(sampled_.p, DType::I32, {batch});
         Tensor logical(sample_pos_.p, DType::I32, {batch});
         if (compact && !constrained) {
@@ -7786,14 +8024,16 @@ private:
     bool mtp_sampled_round_ = false;
     std::vector<DecodeGraph> mtp_catch_graphs_; // (batch - 1) * max_width_ + width - 1
     std::vector<DecodeGraph> verify_graphs_; // (batch - 1) * max_width_ + width - 1
+    std::vector<DecodeGraph> verify_tail_graphs_;
     // A verification round's commit (commit_verified), indexed as verify_graphs_.
     std::vector<DecodeGraph> commit_graphs_;
     // screened-lm-head (screened_round): the screened rounds' decode and verification graphs, indexed as
     // graphs_ and verify_graphs_.
     bool screened_head_ = false;
     std::array<DecodeGraph, kMaximumConcurrency> screened_graphs_;
-    std::vector<DecodeGraph> screened_verify_graphs_;
-    std::vector<DecodeGraph> tree_verify_graphs_, screened_tree_verify_graphs_;
+    std::vector<DecodeGraph> screened_verify_graphs_, screened_verify_tail_graphs_;
+    std::vector<DecodeGraph> tree_verify_graphs_, tree_verify_tail_graphs_;
+    std::vector<DecodeGraph> screened_tree_verify_graphs_, screened_tree_verify_tail_graphs_;
     // The startup capture (capture_graph_set, candidates §23 NU-04):
     // whether it is capturing now (graphs upload instead of launching), whether it ran (a later capture is
     // reported), how many graphs it captured and the device memory they took.
@@ -7919,7 +8159,7 @@ private:
     // pair width, INFERNIX_PAIR_DRAFT_COST below for one verified column of the round), each fitted
     // on this device; the draft cost replaced the 0.47 the 5090's cost model paid.
     static inline const double kPairWidthCost        = policy_double("INFERNIX_PAIR_WIDTH_COST", 0.16);
-    static inline const double kMultiRowWidthCost    = policy_double("INFERNIX_MULTIROW_WIDTH_COST", 0.12);
+    static inline const double kMultiRowWidthCost    = policy_double("INFERNIX_MULTIROW_WIDTH_COST", 0.05);
     static inline const double kDFlashPairDraftCost =
         policy_double("INFERNIX_PAIR_DRAFT_COST", 0.12);
     static inline const double kDFlashPairProposalCost =
@@ -8023,55 +8263,62 @@ private:
         if (++lane.mtp_policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, most); }
         return best;
     }
-    // dflash2-pairs with --draft-tokens auto: the drafts per row a multi-row round verifies after its
-    // proposal, from each row's expected tokens: a drafter row's from its drafts' calibrated
-    // probabilities, a copy row's from its bucket's acceptance (its whole copy is verified, so it
-    // bounds the width from below). `extents`: each row's drafts so far. One draft more every
-    // kProbeInterval multi-row rounds, as for one row.
+    // dflash2-pairs with --draft-tokens auto: shared neural draft cap chosen via D-Cut
+    // (`choose_dcut_batch_cap`) from each drafter row's calibrated step survival rates and the
+    // piecewise / MoE batch round cost (with any n-gram copy row's full width setting the cost
+    // floor so neural drafts are never pruned unnecessarily below copy width). One draft more
+    // every kProbeInterval multi-row rounds, as for one row.
     std::int32_t dflash2_pair_width(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> extents) {
-        const std::size_t rows = lanes.size();
-        std::array<double, kPairMaxDraftsCapacity + 1> sum_tokens{};
-        std::int32_t least = 0, most = 0;
-        for (std::size_t b = 0; b < rows; ++b) {
-            const Lane& lane     = lanes_[lanes[b]];
+        const auto batch = static_cast<std::int32_t>(lanes.size());
+        if (batch <= 0) { return 0; }
+        if (batch == 1) { return extents[0]; }
+        std::array<std::int32_t, kMaximumConcurrency> dcut_extents{};
+        std::array<std::array<double, 8>, kMaximumConcurrency> dcut_rates{};
+        std::int32_t max_neural_ext = 0;
+        std::int32_t max_ngram_ext  = 0;
+        for (std::int32_t b = 0; b < batch; ++b) {
+            if (from_ngram_[b]) {
+                max_ngram_ext = std::max(max_ngram_ext, extents[b]);
+                continue;
+            }
             const std::int32_t n = std::clamp(extents[b], 0, kPairMaxDraftsCapacity);
-            most                 = std::max(most, n);
-            const double p       = from_ngram_[b] && ngram_bucket_[b] >= 0
-                                       ? lane.ngram_accept[static_cast<std::size_t>(ngram_bucket_[b])]
-                                       : 0.0;
-            if (from_ngram_[b]) { least = std::max(least, n); }
-            double reach   = 1.0;
-            double row_tok = 1.0;
-            sum_tokens[0] += row_tok;
-            for (std::int32_t k = 1; k <= kDFlashPairMaxDrafts; ++k) {
-                const auto at = static_cast<std::size_t>(k);
-                if (k <= n) {
-                    if (from_ngram_[b]) {
-                        reach *= p;
-                        row_tok += reach;
-                    } else {
-                        row_tok = runtime::speculative::expected_draft_tokens(
-                            lane.dflash_calibration,
-                            std::span<const float>(dflash_confidence_[b].data(), static_cast<std::size_t>(n)), k);
-                    }
-                }
-                sum_tokens[at] += row_tok;
+            dcut_extents[b]      = n;
+            max_neural_ext       = std::max(max_neural_ext, n);
+            const Lane& lane     = lanes_[lanes[b]];
+            const std::span<const float> conf_span(dflash_confidence_[b].data(), static_cast<std::size_t>(n));
+            double e_prev = 1.0, reach = 1.0;
+            for (std::int32_t j = 0; j < n; ++j) {
+                const double e_cur = runtime::speculative::expected_draft_tokens(
+                    lane.dflash_calibration, conf_span, j + 1);
+                const double delta = std::max(0.0, e_cur - e_prev);
+                const double rate  = reach > 1e-9 ? std::clamp(delta / reach, 0.0, 1.0) : 0.0;
+                dcut_rates[b][static_cast<std::size_t>(j)] = rate;
+                reach *= rate;
+                e_prev = e_cur;
             }
         }
-        least             = std::clamp(least, 0, kPairMaxDraftsCapacity);
-        most              = std::clamp(most, least, kPairMaxDraftsCapacity);
-        const double cost = rows >= 3 ? kMultiRowWidthCost : kDFlashPairDraftCost;
-        std::int32_t best = least;
-        double best_score = -1.0;
-        for (std::int32_t k = least; k <= most; ++k) {
-            const double score =
-                sum_tokens[static_cast<std::size_t>(k)] / (1.0 + kDFlashPairProposalCost + cost * k);
-            if (score > best_score) {
-                best_score = score;
-                best       = k;
-            }
-        }
-        if (++pair_policy_rounds_ % kProbeInterval == 0) { best = std::min(best + 1, most); }
+        if (max_neural_ext <= 1) { return max_neural_ext; }
+        const double dense_equiv   = dense_equiv_experts();
+        const std::int32_t experts = dim(c_.moe.experts), top_k = dim(c_.moe.top_k);
+        const bool fixed_override =
+            batch == 2 ? (replay_clock_ || kHasPairWidthCostOverride)
+                       : (replay_clock_ || kHasMultiRowWidthCostOverride || options_.device_experts);
+        const double slope     = batch >= 3 ? kMultiRowWidthCost : kDFlashPairDraftCost;
+        const double tile_cost = std::min(slope, 0.10);
+        const auto cost_fn     = [&](std::int32_t w) noexcept {
+            const std::int32_t vw = std::max(max_ngram_ext, w);
+            if (vw <= 0) { return 1.0 + kDFlashPairProposalCost; }
+            const double verify_cost =
+                fixed_override
+                    ? (1.0 + (vw <= 3 ? tile_cost * vw : tile_cost * 3 + slope * (vw - 3)))
+                    : moe_round_cost(batch, vw, experts, top_k, dense_equiv, 0.0);
+            return verify_cost + kDFlashPairProposalCost;
+        };
+        std::int32_t best = choose_dcut_batch_cap(
+            batch, std::span<const std::int32_t>(dcut_extents.data(), static_cast<std::size_t>(batch)),
+            std::span<const std::array<double, 8>>(dcut_rates.data(), static_cast<std::size_t>(batch)),
+            cost_fn);
+        if (++pair_policy_rounds_ % kProbeInterval == 0) { best = std::min(best + 1, max_neural_ext); }
         return best;
     }
     std::vector<DecodeGraph> dflash_propose_graphs_; // batch - 1
@@ -8083,6 +8330,21 @@ private:
     std::int32_t max_width_   = 1;
     std::int32_t round_width_ = 1;
     std::size_t proposer_tokens_ = 0;
+    std::unique_ptr<qwen3_5::detail::DualGenNgramProposer> cross_request_proposer_;
+    bool cross_boundaries_set_ = false;
+    void init_cross_boundaries(std::span<const TokenId> boundaries) {
+        if (cross_request_proposer_ && !cross_boundaries_set_ && !boundaries.empty()) {
+            cross_request_proposer_->set_boundaries(
+                std::vector<qwen3_5::detail::DualGenNgramProposer::Token>(boundaries.begin(), boundaries.end()));
+            cross_boundaries_set_ = true;
+        }
+    }
+    [[nodiscard]] static float ngram_branch_q0(std::uint32_t occ, std::uint32_t alt_occ) noexcept {
+        if (alt_occ == 0U) { return 1.0F; }
+        const double main_est = occ > alt_occ ? static_cast<double>(occ - alt_occ) : static_cast<double>(occ);
+        const double q0       = main_est / (main_est + static_cast<double>(alt_occ));
+        return static_cast<float>(std::clamp(q0, 0.50, 0.90));
+    }
     DeviceBuffer records_backing_, ple_records_, qsa_records_, spec_device_;
     PinnedHostBuffer spec_host_{1};
     SpecLayout spec_layout_;
@@ -8105,6 +8367,10 @@ private:
     std::vector<PagedKVBatchLayerView> kv_compact_layers_;
     std::array<bool, kMaximumConcurrency> row_is_tree_{};
     std::array<std::int32_t, kMaximumConcurrency> tree_side_token_{};
+    std::array<std::int32_t, kMaximumConcurrency> ngram_alt_token_{};
+    std::array<float, kMaximumConcurrency> ngram_alt_q0_{};
+    std::array<std::int32_t, kMaximumConcurrency> ngram_proposal_alt_token_{};
+    std::array<float, kMaximumConcurrency> ngram_proposal_alt_q0_{};
     std::vector<std::uint8_t> live_;
     std::vector<std::int32_t> window_;
     std::vector<std::uint32_t> row_ids_;

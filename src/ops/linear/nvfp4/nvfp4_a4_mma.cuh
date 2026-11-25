@@ -44,8 +44,8 @@ __device__ __forceinline__ int nvfp4_a4_swizzled_byte(int row, int logical_byte)
 // code bytes and p * scale_plane scale bytes into the activation planes.
 template <class Schedule>
 __device__ __forceinline__ void
-stage_nvfp4_a4_activation(const std::uint8_t* __restrict__ x,
-                          const std::uint8_t* __restrict__ x_scales, int input_rows,
+stage_nvfp4_a4_activation(const std::uint8_t* x,
+                          const std::uint8_t* x_scales, int input_rows,
                           std::int64_t code_plane, std::int64_t scale_plane,
                           Nvfp4A4SharedStorage<Schedule>& shared, int stage, int k_tile,
                           int token_begin, int active_tokens) {
@@ -176,7 +176,7 @@ stage_nvfp4_a4_weight(const std::uint8_t* __restrict__ codes,
 template <class Schedule, bool FullTokens, class Epilogue, class OutputPolicy, class RowPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_mma_kernel(
-    const std::uint8_t* __restrict__ x, const std::uint8_t* __restrict__ x_scales,
+    const std::uint8_t* x, const std::uint8_t* x_scales,
     const std::uint8_t* __restrict__ weight_codes, const std::uint8_t* __restrict__ weight_scales,
     int rows, int input_rows, std::int64_t code_plane, std::int64_t scale_plane, float alpha,
     OutputPolicy output, Epilogue epilogue, RowPolicy row_policy, int token_offset, int count) {
